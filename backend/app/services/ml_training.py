@@ -1,0 +1,644 @@
+# ============================================================
+# M10 — Boucle Adaptative ML
+# Celery Beat 02:00 → Dataset enrichi → Ré-entraînement →
+# LOAO Validation → Auto-deploy si F1↑ + FPR↓ → Rollback sinon
+# Valide H3 : ΔF1 >= +0.10 après 4 semaines
+# ============================================================
+
+import asyncio
+import json
+import logging
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+from app.core.celery_app import celery_app
+from app.ml.features.preprocessor import CICIDSPreprocessor
+from app.ml.models.ensemble import EnsembleAnomalyDetector
+from app.services.websocket_manager import ws_manager
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Chemins
+# ============================================================
+
+MODEL_BASE = Path("data/models")
+BACKUP_DIR = Path("data/models/backups")
+PCAP_DIR = Path("data/dast_captures")
+REGISTRY_PATH = Path("data/models/registry.json")
+
+
+# ============================================================
+# Registre local des modèles
+# ============================================================
+
+class ModelRegistry:
+    """
+    Registre local des versions de modèles.
+    Garde l'historique de toutes les versions avec leurs métriques.
+    """
+
+    def __init__(self):
+        REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not REGISTRY_PATH.exists():
+            self._save({"versions": [], "active_version": None})
+
+    def _load(self) -> dict:
+        if not REGISTRY_PATH.exists():
+            return {"versions": [], "active_version": None}
+
+        with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _save(self, data: dict):
+        REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def get_active(self) -> Optional[dict]:
+        data = self._load()
+        active_version = data.get("active_version")
+        if not active_version:
+            return None
+
+        for version in data.get("versions", []):
+            if version.get("version") == active_version:
+                return version
+        return None
+
+    def get_version(self, version: str) -> Optional[dict]:
+        data = self._load()
+        for v in data.get("versions", []):
+            if v.get("version") == version:
+                return v
+        return None
+
+    def register(self, version: str, metrics: dict, model_path: str):
+        data = self._load()
+
+        entry = {
+            "version": version,
+            "metrics": metrics,
+            "model_path": model_path,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "is_active": False,
+        }
+
+        data.setdefault("versions", []).append(entry)
+        self._save(data)
+
+        logger.info(
+            "Version enregistrée: %s | F1=%.4f | FPR=%.4f",
+            version,
+            float(metrics.get("f1_mean", 0.0) or 0.0),
+            float(metrics.get("fpr_mean", 0.0) or 0.0),
+        )
+
+    def activate(self, version: str):
+        data = self._load()
+
+        found = False
+        for v in data.get("versions", []):
+            is_target = v.get("version") == version
+            v["is_active"] = is_target
+            if is_target:
+                found = True
+
+        if not found:
+            raise ValueError(f"Version introuvable dans le registre: {version}")
+
+        data["active_version"] = version
+        self._save(data)
+
+        logger.info("Version activée: %s", version)
+
+    def get_history(self, last_n: int = 10) -> list:
+        data = self._load()
+        versions = data.get("versions", [])
+        return versions[-last_n:] if last_n > 0 else versions
+
+    def validate_h3(self) -> dict:
+        """
+        Valide H3 : ΔF1 >= +0.10 entre v0 et vN actif.
+        """
+        data = self._load()
+        versions = data.get("versions", [])
+
+        if len(versions) < 2:
+            return {
+                "h3_validated": False,
+                "message": "Pas assez de versions pour valider H3",
+                "delta_f1": 0.0,
+                "target": "ΔF1 >= +0.10 après 4 semaines",
+            }
+
+        v0 = versions[0]
+        active = self.get_active() or versions[-1]
+
+        f1_v0 = float(v0.get("metrics", {}).get("f1_mean", 0.0) or 0.0)
+        f1_vn = float(active.get("metrics", {}).get("f1_mean", 0.0) or 0.0)
+        delta = f1_vn - f1_v0
+
+        return {
+            "h3_validated": delta >= 0.10,
+            "delta_f1": round(delta, 4),
+            "f1_v0": round(f1_v0, 4),
+            "f1_vN": round(f1_vn, 4),
+            "version_v0": v0.get("version"),
+            "version_vN": active.get("version"),
+            "target": "ΔF1 >= +0.10 après 4 semaines",
+        }
+
+
+# ============================================================
+# Boucle adaptative
+# ============================================================
+
+class AdaptiveMLLoop:
+    """
+    Implémente la boucle adaptative Purple Team.
+    Exécutée par Celery Beat chaque nuit à 02:00.
+    """
+
+    def __init__(self):
+        self.registry = ModelRegistry()
+        self.preprocessor = CICIDSPreprocessor()
+
+    def run(self) -> dict:
+        start_time = datetime.now(timezone.utc)
+        version = f"v_{int(start_time.timestamp())}"
+
+        logger.info("=== M10 Boucle Adaptative — %s ===", version)
+
+        report = {
+            "version": version,
+            "started_at": start_time.isoformat(),
+            "steps": {},
+            "deployed": False,
+            "rolledback": False,
+        }
+
+        try:
+            # Étape 1 — Collecte dataset enrichi
+            step1 = self._step_collect_dataset()
+            report["steps"]["1_dataset"] = step1
+
+            X_benign = step1.get("X_benign")
+            splits = step1.get("splits")
+
+            if X_benign is None or len(X_benign) == 0:
+                raise ValueError("Dataset BENIGN vide — ré-entraînement annulé")
+
+            # Étape 2 — Entraînement
+            step2 = self._step_train(X_benign, version)
+            report["steps"]["2_train"] = step2
+
+            # Étape 3 — Validation LOAO
+            if splits:
+                step3 = self._step_validate_loao(splits, version)
+            else:
+                step3 = {
+                    "success": False,
+                    "skipped": True,
+                    "reason": "Splits LOAO non disponibles",
+                    "metrics": {
+                        "precision_mean": 0.0,
+                        "recall_mean": 0.0,
+                        "f1_mean": 0.0,
+                        "fpr_mean": 1.0,
+                        "h1_validated": False,
+                        "by_attack": {},
+                    },
+                }
+
+            report["steps"]["3_loao"] = step3
+
+            # Étape 4 — Décision
+            decision = self._step_deployment_decision(version, report["steps"])
+            report["steps"]["4_decision"] = decision
+
+            if decision.get("deploy"):
+                step5 = self._step_deploy(version)
+                report["steps"]["5_deploy"] = step5
+                report["deployed"] = True
+                self._notify_deployment(version, step3)
+            else:
+                step5 = self._step_rollback(
+                    version,
+                    decision.get("reason", "Performances insuffisantes")
+                )
+                report["steps"]["5_rollback"] = step5
+                report["rolledback"] = True
+                self._notify_rollback(
+                    version,
+                    decision.get("reason", "Performances insuffisantes")
+                )
+
+        except Exception as e:
+            logger.exception("M10 erreur: %s", e)
+            report["error"] = str(e)
+            report["rolledback"] = True
+            try:
+                report["steps"]["5_rollback"] = self._step_rollback(version, str(e))
+            except Exception as rollback_error:
+                report["steps"]["5_rollback"] = {
+                    "success": False,
+                    "reason": f"Rollback échoué: {rollback_error}",
+                }
+
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["h3_status"] = self.registry.validate_h3()
+
+        logger.info(
+            "=== M10 terminé | deployed=%s | rolledback=%s ===",
+            report["deployed"],
+            report["rolledback"],
+        )
+
+        return report
+
+    # ============================================================
+    # Étape 1 — Collecte dataset enrichi
+    # ============================================================
+
+    def _step_collect_dataset(self) -> dict:
+        """
+        Agrège :
+        - Trafic BENIGN CIC-IDS-2017
+        - Captures DAST (comptées / journalisées)
+        """
+        logger.info("Étape 1 — Collecte dataset enrichi")
+
+        df = self.preprocessor.load_dataset()
+        if df is None or getattr(df, "empty", False):
+            raise ValueError("Le dataset CIC-IDS est vide ou introuvable")
+
+        dast_summary = self._load_dast_captures()
+
+        splits, X_benign = self.preprocessor.prepare_loao_splits(df)
+
+        MODEL_BASE.mkdir(parents=True, exist_ok=True)
+        self.preprocessor.save_scaler(str(MODEL_BASE / "scaler.pkl"))
+
+        return {
+            "success": True,
+            "dataset_rows": int(len(df)),
+            "dataset_size": int(len(X_benign)),
+            "dast_samples": int(dast_summary.get("dast_samples", 0)),
+            "pcap_files": int(dast_summary.get("pcap_files", 0)),
+            "n_splits": int(len(splits)) if splits else 0,
+            "X_benign": X_benign,
+            "splits": splits,
+        }
+
+    def _load_dast_captures(self) -> dict:
+        """
+        Charge les fichiers PCAP DAST pour journalisation et comptage.
+        Cette version reste compatible avec ton projet actuel.
+        """
+        if not PCAP_DIR.exists():
+            logger.info("Aucun dossier de captures DAST trouvé: %s", PCAP_DIR)
+            return {
+                "pcap_files": 0,
+                "dast_samples": 0,
+            }
+
+        pcap_files = list(PCAP_DIR.glob("*.pcap"))
+        if not pcap_files:
+            return {
+                "pcap_files": 0,
+                "dast_samples": 0,
+            }
+
+        total_packets = 0
+
+        for pcap_path in pcap_files:
+            try:
+                from scapy.all import rdpcap  # type: ignore
+
+                packets = rdpcap(str(pcap_path))
+                packet_count = len(packets)
+                total_packets += packet_count
+
+                logger.info(
+                    "PCAP DAST chargé: %s | %d paquets",
+                    pcap_path.name,
+                    packet_count,
+                )
+
+            except ImportError:
+                logger.warning("Scapy non disponible — captures DAST ignorées")
+                break
+            except Exception as e:
+                logger.warning("Erreur lecture PCAP %s: %s", pcap_path, e)
+
+        return {
+            "pcap_files": len(pcap_files),
+            "dast_samples": total_packets,
+        }
+
+    # ============================================================
+    # Étape 2 — Ré-entraînement
+    # ============================================================
+
+    def _step_train(self, X_benign: np.ndarray, version: str) -> dict:
+        logger.info("Étape 2 — Entraînement sur %d flux BENIGN", len(X_benign))
+
+        version_path = MODEL_BASE / version
+        version_path.mkdir(parents=True, exist_ok=True)
+
+        detector = EnsembleAnomalyDetector()
+        detector.fit(X_benign)
+        detector.save(str(version_path))
+
+        scaler_src = MODEL_BASE / "scaler.pkl"
+        scaler_dst = version_path / "scaler.pkl"
+        if scaler_src.exists():
+            shutil.copy2(str(scaler_src), str(scaler_dst))
+
+        return {
+            "success": True,
+            "model_path": str(version_path),
+            "dataset_size": int(len(X_benign)),
+        }
+
+    # ============================================================
+    # Étape 3 — Validation LOAO
+    # ============================================================
+
+    def _step_validate_loao(self, splits: dict, version: str) -> dict:
+        logger.info("Étape 3 — Validation LOAO")
+
+        version_path = MODEL_BASE / version
+        detector = EnsembleAnomalyDetector()
+        detector.load(str(version_path))
+
+        loao_results = detector.run_loao_validation(splits)
+        summary = loao_results.get("__summary__", {})
+
+        recall_mean = float(summary.get("mean_recall", 0.0) or 0.0)
+        precision_mean = float(summary.get("mean_precision", recall_mean) or recall_mean)
+
+        f1_mean = 0.0
+        if precision_mean + recall_mean > 0:
+            f1_mean = 2 * (precision_mean * recall_mean) / (
+                precision_mean + recall_mean
+            )
+
+        # Estimation FPR sur BENIGN
+        try:
+            first_split = next(iter(splits.values()))
+            X_benign_eval = first_split[0]
+            benign_preds = detector.predict_label(X_benign_eval)
+            benign_preds = np.array(benign_preds).astype(int)
+            fpr_mean = float(benign_preds.sum()) / max(len(benign_preds), 1)
+        except Exception:
+            fpr_mean = 1.0
+
+        metrics = {
+            "precision_mean": round(precision_mean, 4),
+            "recall_mean": round(recall_mean, 4),
+            "f1_mean": round(float(f1_mean), 4),
+            "fpr_mean": round(float(fpr_mean), 4),
+            "h1_validated": recall_mean >= 0.70,
+            "by_attack": {
+                k: _clean_report(v)
+                for k, v in loao_results.items()
+                if k != "__summary__"
+            },
+        }
+
+        self.registry.register(
+            version=version,
+            metrics=metrics,
+            model_path=str(version_path),
+        )
+
+        return {
+            "success": True,
+            "metrics": metrics,
+            "loao_results": _clean_report(loao_results),
+        }
+
+    # ============================================================
+    # Étape 4 — Décision de déploiement
+    # ============================================================
+
+    def _step_deployment_decision(self, version: str, steps: dict) -> dict:
+        logger.info("Étape 4 — Décision déploiement")
+
+        loao_step = steps.get("3_loao", {})
+        new_metrics = loao_step.get("metrics", {})
+
+        new_f1 = float(new_metrics.get("f1_mean", 0.0) or 0.0)
+        new_fpr = float(new_metrics.get("fpr_mean", 1.0) or 1.0)
+
+        active = self.registry.get_active()
+        if not active:
+            return {
+                "deploy": True,
+                "reason": "Premier déploiement — pas de baseline",
+                "new_f1": round(new_f1, 4),
+                "new_fpr": round(new_fpr, 4),
+            }
+
+        current_f1 = float(active.get("metrics", {}).get("f1_mean", 0.0) or 0.0)
+        current_fpr = float(active.get("metrics", {}).get("fpr_mean", 1.0) or 1.0)
+
+        # Petite marge pour éviter les déploiements sur simple bruit
+        min_f1_gain = 0.01
+        min_fpr_gain = 0.0
+
+        f1_improved = new_f1 > (current_f1 + min_f1_gain)
+        fpr_improved = new_fpr < (current_fpr - min_fpr_gain)
+
+        if f1_improved and fpr_improved:
+            reason = (
+                f"F1 amélioré: {current_f1:.4f} → {new_f1:.4f} | "
+                f"FPR réduit: {current_fpr:.4f} → {new_fpr:.4f}"
+            )
+            return {
+                "deploy": True,
+                "reason": reason,
+                "current_f1": round(current_f1, 4),
+                "new_f1": round(new_f1, 4),
+                "current_fpr": round(current_fpr, 4),
+                "new_fpr": round(new_fpr, 4),
+                "f1_delta": round(new_f1 - current_f1, 4),
+            }
+
+        reason = (
+            f"Performances insuffisantes | "
+            f"F1: {current_f1:.4f} → {new_f1:.4f} "
+            f"({'↑' if f1_improved else '↓/='}) | "
+            f"FPR: {current_fpr:.4f} → {new_fpr:.4f} "
+            f"({'↓ bon' if fpr_improved else '↑/='})"
+        )
+
+        return {
+            "deploy": False,
+            "reason": reason,
+            "current_f1": round(current_f1, 4),
+            "new_f1": round(new_f1, 4),
+            "current_fpr": round(current_fpr, 4),
+            "new_fpr": round(new_fpr, 4),
+        }
+
+    # ============================================================
+    # Étape 5a — Déploiement automatique
+    # ============================================================
+
+    def _step_deploy(self, version: str) -> dict:
+        logger.info("Étape 5 — Déploiement %s", version)
+
+        version_path = MODEL_BASE / version
+        if not version_path.exists():
+            raise FileNotFoundError(f"Dossier version introuvable: {version_path}")
+
+        active = self.registry.get_active()
+
+        # Backup de la version active
+        if active and active.get("model_path"):
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            backup_path = BACKUP_DIR / f"backup_{active['version']}"
+            src_path = Path(active["model_path"])
+
+            if src_path.exists() and not backup_path.exists():
+                shutil.copytree(src_path, backup_path, dirs_exist_ok=True)
+
+        # Copie du nouveau modèle vers MODEL_BASE
+        for item in version_path.iterdir():
+            dest = MODEL_BASE / item.name
+
+            if item.is_dir():
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
+
+        self.registry.activate(version)
+
+        # Reload en mémoire
+        try:
+            from app.services.ml_service import MLAnomalyEngine
+
+            engine = MLAnomalyEngine()
+            engine.detector.load(str(MODEL_BASE))
+            logger.info("✅ Modèle %s chargé en mémoire", version)
+        except Exception as e:
+            logger.warning("Rechargement mémoire échoué: %s", e)
+
+        return {
+            "success": True,
+            "version": version,
+            "model_path": str(MODEL_BASE),
+        }
+
+    # ============================================================
+    # Étape 5b — Rollback
+    # ============================================================
+
+    def _step_rollback(self, version: str, reason: str) -> dict:
+        logger.warning("Rollback — %s rejeté: %s", version, reason)
+
+        active = self.registry.get_active()
+
+        version_path = MODEL_BASE / version
+        if version_path.exists():
+            shutil.rmtree(version_path, ignore_errors=True)
+
+        return {
+            "success": True,
+            "rejected": version,
+            "reason": reason,
+            "active_version": active["version"] if active else None,
+        }
+
+    # ============================================================
+    # Notifications WebSocket
+    # ============================================================
+
+    def _notify_deployment(self, version: str, loao_result: dict):
+        metrics = loao_result.get("metrics", {})
+        msg = {
+            "type": "ML_DEPLOYED",
+            "version": version,
+            "f1_mean": metrics.get("f1_mean", 0),
+            "recall": metrics.get("recall_mean", 0),
+            "fpr": metrics.get("fpr_mean", 0),
+            "message": f"Nouveau modèle {version} déployé automatiquement",
+        }
+        self._safe_broadcast(msg)
+
+    def _notify_rollback(self, version: str, reason: str):
+        msg = {
+            "type": "ML_ROLLBACK",
+            "version": version,
+            "reason": reason,
+            "message": f"Ré-entraînement {version} rejeté — rollback",
+        }
+        self._safe_broadcast(msg)
+
+    def _safe_broadcast(self, message: dict):
+        try:
+            asyncio.run(ws_manager.broadcast(message, "all"))
+        except RuntimeError:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(ws_manager.broadcast(message, "all"))
+                else:
+                    loop.run_until_complete(ws_manager.broadcast(message, "all"))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+# ============================================================
+# Tâche Celery
+# ============================================================
+
+@celery_app.task(name="app.services.ml_training.retrain_models")
+def retrain_models():
+    """
+    Point d'entrée Celery pour la boucle adaptative M10.
+    """
+    logger.info("🔄 M10 Celery Beat déclenché à 02:00")
+
+    adaptive_loop = AdaptiveMLLoop()
+    report = adaptive_loop.run()
+
+    report_path = MODEL_BASE / f"training_report_{report['version']}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    report_clean = _clean_report(report)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report_clean, f, indent=2, ensure_ascii=False, default=str)
+
+    logger.info("Rapport sauvegardé: %s", report_path)
+    return report_clean
+
+
+def _clean_report(obj):
+    """
+    Nettoyage récursif pour sérialisation JSON.
+    """
+    if isinstance(obj, dict):
+        return {k: _clean_report(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_report(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_clean_report(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float32, np.float64, np.floating)):
+        return float(obj)
+    if isinstance(obj, (np.int32, np.int64, np.integer)):
+        return int(obj)
+    return obj

@@ -1,0 +1,151 @@
+# ============================================================
+# M8 — Nightly Full Scan
+# ============================================================
+
+name: CyberSentinel Nightly — Full Security Scan
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+
+jobs:
+  loao-validation:
+    name: "M2 — LOAO Validation Complète"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ML dependencies
+        run: |
+          pip install scikit-learn numpy pandas tensorflow joblib pyarrow
+
+      - name: Run full LOAO validation
+        run: |
+          python3 scripts/run_loao.py \
+            --data-dir data/raw \
+            --output loao-results.json || true
+
+      - name: Upload LOAO results
+        uses: actions/upload-artifact@v4
+        with:
+          name: loao-results
+          path: loao-results.json
+          retention-days: 14
+
+  sast-full:
+    name: "M4 — SAST Scan Complet"
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          pip install semgrep
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
+          tar xzf gitleaks_8.18.0_linux_x64.tar.gz
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Full SAST scan
+        run: |
+          semgrep \
+            --config p/owasp-top-ten \
+            --config p/python \
+            --config p/javascript \
+            --config p/secrets \
+            --sarif --output semgrep-full.sarif . || true
+
+          trivy fs \
+            --format sarif \
+            --output trivy-full.sarif \
+            --severity CRITICAL,HIGH,MEDIUM,LOW . || true
+
+          gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path gitleaks-full.json \
+            --exit-code 0 || true
+
+      - name: Upload full SAST results
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-full-results
+          path: |
+            semgrep-full.sarif
+            trivy-full.sarif
+            gitleaks-full.json
+          retention-days: 14
+
+  benchmark-ids:
+    name: "M1 — Benchmark Latence IDS"
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp
+
+      - name: Run IDS latency benchmark
+        run: |
+          if [ -n "$STAGING_API_URL" ]; then
+            python3 scripts/benchmark_ids.py \
+              --api-url "$STAGING_API_URL" \
+              --n-requests 1000 \
+              --output benchmark-results.json || true
+          else
+            echo '{"message":"STAGING_API_URL non configuré"}' > benchmark-results.json
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
+          retention-days: 14
+
+  nightly-report:
+    name: "Rapport Performance Nightly"
+    runs-on: ubuntu-latest
+    needs: [loao-validation, sast-full, benchmark-ids]
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Generate nightly report
+        run: |
+          python3 scripts/generate_report.py \
+            --output nightly-report.json || true
+
+      - name: Upload nightly report
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-report
+          path: nightly-report.json
+          retention-days: 30

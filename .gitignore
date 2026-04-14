@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+backend/venv/
+env/
+
+# Node
+node_modules/
+dist/
+build/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Env secrets
+.env
+.env.*
+!.env.example
+frontend/.env
+
+# Data / models / reports
+data/raw/
+data/models/
+data/dast_captures/
+data/uploads_dast/
+reports/
+*.db
+*.sqlite3
+backend/celerybeat-schedule
+
+# Logs / cache
+*.log
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Archives / binaries
+*.tar.gz
+*.zip
+*.bin
+
+# Optional generated folders
+suricata/
+backend/test_secret.env

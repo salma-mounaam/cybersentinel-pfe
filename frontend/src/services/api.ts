@@ -1,0 +1,227 @@
+// ============================================================
+// services/api.ts — Tous les appels HTTP vers le backend réel
+// Base URL configurable via variable d'env
+// ============================================================
+
+const API_BASE =
+  process.env.REACT_APP_API_URL?.replace(/\/$/, "") || "http://localhost:8000/api";
+
+async function parseJsonSafe<T>(res: Response, method: string, url: string): Promise<T> {
+  const text = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`${method} ${url} → ${res.status} | ${text.slice(0, 200)}`);
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`${method} ${url} → réponse non JSON : ${text.slice(0, 200)}`);
+  }
+}
+
+async function get<T>(url: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${url}`);
+  return parseJsonSafe<T>(res, "GET", url);
+}
+
+async function post<T>(url: string, body?: any): Promise<T> {
+  const res = await fetch(`${API_BASE}${url}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return parseJsonSafe<T>(res, "POST", url);
+}
+
+async function patch<T>(url: string, body: any): Promise<T> {
+  const res = await fetch(`${API_BASE}${url}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseJsonSafe<T>(res, "PATCH", url);
+}
+
+async function postForm<T>(url: string, formData: FormData): Promise<T> {
+  const res = await fetch(`${API_BASE}${url}`, {
+    method: "POST",
+    body: formData,
+  });
+  return parseJsonSafe<T>(res, "POST", url);
+}
+
+// ── M1 Alertes ───────────────────────────────────────────────
+export const alertsAPI = {
+  getRecent: (limit = 20) =>
+    get<{ total: number; alerts: any[] }>(`/alerts/recent?limit=${limit}`),
+
+  getAll: (params?: { severity?: string; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.severity) q.set("severity", params.severity);
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.offset) q.set("offset", String(params.offset));
+    return get<{ total: number; alerts: any[] }>(`/alerts/?${q.toString()}`);
+  },
+
+  getStats: () => get<any>("/alerts/stats"),
+  getById: (id: number) => get<any>(`/alerts/${id}`),
+};
+
+// ── M2/M10 ML ────────────────────────────────────────────────
+export const mlAPI = {
+  getStatus: () => get<any>("/ml/status"),
+  triggerTraining: () => post<any>("/ml/train"),
+  trainSync: () => post<any>("/ml/train/sync"),
+  getLoaoResults: () => get<any>("/ml/loao-results"),
+  getRegistry: () => get<any>("/ml/registry"),
+  getH3: () => get<any>("/ml/h3-validation"),
+  getReports: () => get<any>("/ml/training-reports"),
+  rollback: () => post<any>("/ml/rollback"),
+  deployVersion: (v: string) => post<any>(`/ml/deploy/${v}`),
+};
+
+// ── M3 Fusion ────────────────────────────────────────────────
+export const fusionAPI = {
+  getStats: () => get<any>("/fusion/stats"),
+  validateH2: (fpr_before: number, fpr_after: number) =>
+    post<any>("/fusion/validate-h2", {
+      fpr_signature: fpr_before,
+      fpr_fusion: fpr_after,
+    }),
+};
+
+// ── M4 SAST ──────────────────────────────────────────────────
+export const sastAPI = {
+  scan: (repo_path: string, repo_name = "", commit_sha = "") =>
+    post<any>("/sast/scan", { repo_path, repo_name, commit_sha }),
+
+  scanSync: (repo_path: string, repo_name = "", commit_sha = "") =>
+    post<any>("/sast/scan/sync", { repo_path, repo_name, commit_sha }),
+
+  uploadScan: (file: File, project_name = "", commit_sha = "") => {
+    const formData = new FormData();
+    formData.append("file", file);
+    if (project_name) formData.append("project_name", project_name);
+    if (commit_sha) formData.append("commit_sha", commit_sha);
+    return postForm<any>("/sast/scan/upload", formData);
+  },
+
+  getFindings: (params?: {
+    tool?: string;
+    severity?: string;
+    limit?: number;
+  }) => {
+    const q = new URLSearchParams();
+    if (params?.tool) q.set("tool", params.tool);
+    if (params?.severity) q.set("severity", params.severity);
+    if (params?.limit) q.set("limit", String(params.limit));
+    return get<{ total: number; findings: any[] }>(`/sast/findings?${q.toString()}`);
+  },
+
+  getStats: () => get<any>("/sast/stats"),
+  getById: (id: number) => get<any>(`/sast/findings/${id}`),
+
+  qualityGate: (data: {
+    critical_count: number;
+    high_count: number;
+    secrets_found: boolean;
+    ml_smoke_pass?: boolean;
+  }) => post<any>("/sast/quality-gate", data),
+};
+
+// ── M5 DAST ──────────────────────────────────────────────────
+export const dastAPI = {
+  getStatus: () => get<any>("/dast/status"),
+  verifyIsolation: () => get<any>("/dast/isolation/verify"),
+
+  startSync: (payload: {
+    target?: "webgoat" | "dvwa";
+    target_url?: string;
+    deploy_target?: boolean;
+  }) => post<any>("/dast/start/sync", payload),
+
+  start: (payload: {
+    target?: "webgoat" | "dvwa";
+    target_url?: string;
+    deploy_target?: boolean;
+  }) => post<any>("/dast/start", payload),
+
+  getFindings: (limit = 50) => get<any>(`/dast/findings?limit=${limit}`),
+};
+
+// ── M6 MITRE ─────────────────────────────────────────────────
+export const mitreAPI = {
+  getTechnique: (id: string) => get<any>(`/mitre/technique/${id}`),
+  listTechniques: () => get<any>("/mitre/techniques"),
+  getMatrix: () => get<any>("/mitre/matrix"),
+  getCweMapping: () => get<any>("/mitre/cwe-mapping"),
+  enrich: (alert: any) => post<any>("/mitre/enrich", alert),
+};
+
+// ── M7 Incidents ─────────────────────────────────────────────
+export const incidentsAPI = {
+  getAll: (params?: {
+    severity?: string;
+    status?: string;
+    technique_id?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const q = new URLSearchParams();
+    if (params?.severity) q.set("severity", params.severity);
+    if (params?.status) q.set("status", params.status);
+    if (params?.technique_id) q.set("technique_id", params.technique_id);
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.offset) q.set("offset", String(params.offset));
+    return get<{ total: number; incidents: any[] }>(`/incidents/?${q.toString()}`);
+  },
+
+  getStats: () => get<any>("/incidents/stats"),
+  getCritical: () => get<any>("/incidents/critical"),
+  getById: (id: number) => get<any>(`/incidents/${id}`),
+
+  updateStatus: (id: number, status: string) =>
+    patch<any>(`/incidents/${id}/status`, { status }),
+
+  computeR: (data: {
+    anomaly_score: number;
+    cvss_score: number;
+    dast_confirmed: boolean;
+    asset_criticality: number;
+  }) => post<any>("/incidents/compute-r", data),
+
+  validateH4: (computed: number[], expert: number[]) =>
+    post<any>("/incidents/validate-h4", {
+      computed_scores: computed,
+      expert_scores: expert,
+    }),
+};
+
+// ── Scoring ──────────────────────────────────────────────────
+export const scoringAPI = {
+  getWeights: () => get<any>("/scoring/weights"),
+  getSLA: () => get<any>("/scoring/sla"),
+  getAssetCriticality: () => get<any>("/scoring/asset-criticality"),
+};
+
+// ── M8 CI/CD ─────────────────────────────────────────────────
+export const cicdAPI = {
+  getRuns: () => get<any>("/cicd/runs"),
+  getGateConfig: () => get<any>("/cicd/quality-gate/config"),
+  getIntegGuide: () => get<any>("/cicd/integration-guide"),
+  sendWebhook: (data: any) => post<any>("/cicd/webhook", data),
+  scanRepo: (repo_url: string, branch = "main") =>
+    post<any>("/cicd/scan/repo", { repo_url, branch }),
+  submitResults: (data: any) => post<any>("/cicd/submit-results", data),
+};
+
+// ── Health ───────────────────────────────────────────────────
+export const healthAPI = {
+  check: async () => {
+    const res = await fetch(
+      process.env.REACT_APP_API_ROOT?.replace(/\/$/, "") || "http://localhost:8000/health"
+    );
+    return res.json();
+  },
+};

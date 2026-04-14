@@ -1,0 +1,137 @@
+# ============================================================
+# CyberSentinel Integration Workflow
+# À copier dans le repo utilisateur
+# ============================================================
+
+name: CyberSentinel Security Analysis
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CYBERSENTINEL_URL: ${{ secrets.CYBERSENTINEL_URL }}
+
+jobs:
+  security-scan:
+    name: "CyberSentinel SAST Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Semgrep
+        run: |
+          pip install semgrep requests
+          semgrep \
+            --config p/owasp-top-ten \
+            --config p/python \
+            --config p/javascript \
+            --sarif \
+            --output semgrep-results.sarif \
+            --quiet . || true
+
+      - name: Run Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          trivy fs \
+            --format sarif \
+            --output trivy-results.sarif \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --quiet . || true
+
+      - name: Run Gitleaks
+        run: |
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
+          tar xzf gitleaks_8.18.0_linux_x64.tar.gz
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path gitleaks-report.json \
+            --exit-code 0 \
+            --quiet || true
+
+      - name: Submit results to CyberSentinel
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          import sys
+          import requests
+
+          url = os.environ.get("CYBERSENTINEL_URL", "").rstrip("/")
+          repo_name = os.environ.get("GITHUB_REPOSITORY", "")
+          commit_sha = os.environ.get("GITHUB_SHA", "")[:8]
+          branch = os.environ.get("GITHUB_REF_NAME", "main")
+          pr_number = os.environ.get("GITHUB_PR_NUMBER", "")
+
+          if not url:
+              print("CYBERSENTINEL_URL non configuré")
+              sys.exit(0)
+
+          payload = {
+              "repo_name": repo_name,
+              "commit_sha": commit_sha,
+              "branch": branch,
+              "pr_number": int(pr_number) if str(pr_number).strip() else None,
+          }
+
+          try:
+              with open("semgrep-results.sarif", "r", encoding="utf-8") as f:
+                  payload["semgrep_sarif"] = json.load(f)
+          except Exception:
+              payload["semgrep_sarif"] = {"runs": []}
+
+          try:
+              with open("trivy-results.sarif", "r", encoding="utf-8") as f:
+                  payload["trivy_sarif"] = json.load(f)
+          except Exception:
+              payload["trivy_sarif"] = {"runs": []}
+
+          try:
+              with open("gitleaks-report.json", "r", encoding="utf-8") as f:
+                  content = f.read().strip()
+                  payload["gitleaks_json"] = json.loads(content) if content else []
+          except Exception:
+              payload["gitleaks_json"] = []
+
+          try:
+              resp = requests.post(
+                  f"{url}/api/cicd/submit-results",
+                  json=payload,
+                  timeout=30
+              )
+              result = resp.json()
+              print(json.dumps(result, indent=2))
+              with open("gate-decision.txt", "w", encoding="utf-8") as f:
+                  f.write(result.get("decision", "PASS"))
+          except Exception as e:
+              print(f"Erreur soumission CyberSentinel: {e}")
+              sys.exit(0)
+          EOF
+        env:
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+
+      - name: Check Quality Gate decision
+        run: |
+          if [ -f gate-decision.txt ]; then
+            DECISION=$(cat gate-decision.txt)
+            echo "Décision Quality Gate : $DECISION"
+            if [ "$DECISION" = "BLOCK" ]; then
+              echo "🚨 CyberSentinel a bloqué ce push"
+              exit 1
+            fi
+          fi
