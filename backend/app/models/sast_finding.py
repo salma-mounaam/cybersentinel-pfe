@@ -93,6 +93,7 @@ class SASTFinding(Base):
     repo_name = Column(String(255), nullable=True)
     commit_sha = Column(String(100), nullable=True)
     pr_number = Column(Integer, nullable=True)
+    scan_id = Column(String(64), index=True, nullable=True)
     sarif_raw = Column(JSON, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

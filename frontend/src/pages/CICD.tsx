@@ -10,6 +10,9 @@ import {
   AlertTriangle,
   GitPullRequest,
   FileCode,
+  Shield,
+  KeyRound,
+  Hash,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
@@ -44,77 +47,156 @@ const statusConfig = {
   },
 };
 
+function formatDate(value?: string) {
+  if (!value) return "—";
+  try {
+    return new Date(value).toLocaleString("fr-FR");
+  } catch {
+    return value;
+  }
+}
+
+function shortSha(sha?: string) {
+  if (!sha) return "—";
+  return sha.slice(0, 8);
+}
+
 function PipelineCard({ pipeline }: { pipeline: any }) {
   const decision = (pipeline.decision || "PENDING").toUpperCase();
-  const config = statusConfig[decision as keyof typeof statusConfig] || statusConfig.PENDING;
+  const config =
+    statusConfig[decision as keyof typeof statusConfig] || statusConfig.PENDING;
+
   const StatusIcon = config.icon;
+
+  const critical = Number(pipeline.critical_count || 0);
+  const high = Number(pipeline.high_count || 0);
+  const medium = Number(pipeline.medium_count || 0);
+  const low = Number(pipeline.low_count || 0);
+  const secretsFound = !!pipeline.secrets_found;
 
   return (
     <Card className="bg-card/50 border-cyber-border hover:border-cyber-violet/30 transition-colors">
-      <CardContent className="p-4">
-        <div className="flex items-start justify-between mb-4">
-          <div className="flex items-center gap-3">
-            <div className={cn("p-2 rounded-lg", config.bg)}>
+      <CardContent className="p-5">
+        <div className="flex items-start justify-between gap-4 mb-5">
+          <div className="flex items-start gap-3">
+            <div className={cn("p-2 rounded-lg mt-0.5", config.bg)}>
               <StatusIcon
                 size={18}
                 className={cn(config.color, decision === "RUNNING" && "animate-spin")}
               />
             </div>
+
             <div>
-              <h4 className="font-medium text-sm">{pipeline.run_id || "—"}</h4>
-              <p className="text-xs text-muted-foreground flex items-center gap-1">
-                <GitBranch size={12} />
-                {pipeline.repo || "—"}
-              </p>
+              <h4 className="font-semibold text-base">
+                {pipeline.run_id || "Pipeline"}
+              </h4>
+
+              <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                <span className="flex items-center gap-1">
+                  <GitBranch size={12} />
+                  {pipeline.repo || "—"}
+                </span>
+
+                <span className="flex items-center gap-1">
+                  <Hash size={12} />
+                  {pipeline.branch || "—"}
+                </span>
+
+                {pipeline.pr_number && (
+                  <span className="flex items-center gap-1">
+                    <GitPullRequest size={12} />
+                    PR #{pipeline.pr_number}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
 
-          <div className="text-right">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             <Badge variant="secondary" className={cn(config.bg, config.color)}>
               {config.label}
             </Badge>
+
             {decision === "BLOCK" && (
-              <Badge variant="secondary" className="bg-cyber-red/10 text-cyber-red ml-2">
+              <Badge variant="secondary" className="bg-cyber-red/10 text-cyber-red">
                 <AlertTriangle size={10} className="mr-1" />
                 PR Bloquée
+              </Badge>
+            )}
+
+            {secretsFound && (
+              <Badge variant="secondary" className="bg-cyber-orange/10 text-cyber-orange">
+                <KeyRound size={10} className="mr-1" />
+                Secret détecté
               </Badge>
             )}
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">
           <div className="p-3 rounded-lg bg-cyber-panel/40 text-center">
-            <p className="text-lg font-bold font-mono text-cyber-red">
-              {pipeline.critical_count || 0}
-            </p>
+            <p className="text-lg font-bold font-mono text-cyber-red">{critical}</p>
             <p className="text-[10px] text-muted-foreground">Critiques</p>
           </div>
+
           <div className="p-3 rounded-lg bg-cyber-panel/40 text-center">
-            <p className="text-lg font-bold font-mono text-cyber-orange">
-              {pipeline.high_count || 0}
-            </p>
+            <p className="text-lg font-bold font-mono text-cyber-orange">{high}</p>
             <p className="text-[10px] text-muted-foreground">Élevées</p>
           </div>
+
           <div className="p-3 rounded-lg bg-cyber-panel/40 text-center">
-            <p className="text-lg font-bold font-mono">{pipeline.source || "manual"}</p>
+            <p className="text-lg font-bold font-mono text-cyber-blue">{medium}</p>
+            <p className="text-[10px] text-muted-foreground">Moyennes</p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-cyber-panel/40 text-center">
+            <p className="text-lg font-bold font-mono text-cyber-green">{low}</p>
+            <p className="text-[10px] text-muted-foreground">Faibles</p>
+          </div>
+
+          <div className="p-3 rounded-lg bg-cyber-panel/40 text-center">
+            <p className="text-sm font-bold font-mono">{pipeline.source || "manual"}</p>
             <p className="text-[10px] text-muted-foreground">Source</p>
           </div>
         </div>
 
-        <div className="flex items-center justify-between mt-4 pt-3 border-t border-border/50 text-xs text-muted-foreground">
-          <div className="flex items-center gap-3">
-            {pipeline.pr_number && (
-              <span className="flex items-center gap-1">
-                <GitPullRequest size={12} />
-                PR #{pipeline.pr_number}
-              </span>
-            )}
-            <span className="flex items-center gap-1">
-              <Clock size={12} />
-              {pipeline.timestamp ? new Date(pipeline.timestamp).toLocaleString("fr-FR") : "—"}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+          <div className="rounded-lg border border-cyber-border bg-cyber-panel/20 p-3">
+            <p className="text-[11px] text-muted-foreground mb-1">Commit SHA</p>
+            <p className="font-mono text-sm">{shortSha(pipeline.commit_sha)}</p>
+          </div>
+
+          <div className="rounded-lg border border-cyber-border bg-cyber-panel/20 p-3">
+            <p className="text-[11px] text-muted-foreground mb-1">Date</p>
+            <p className="text-sm">
+              {formatDate(pipeline.timestamp || pipeline.created_at)}
+            </p>
+          </div>
+        </div>
+
+        {(pipeline.message || pipeline.reason || pipeline.summary) && (
+          <div className="rounded-lg border border-cyber-border bg-cyber-panel/20 p-3 mb-4">
+            <p className="text-[11px] text-muted-foreground mb-1">Détail</p>
+            <p className="text-sm text-foreground">
+              {pipeline.message || pipeline.reason || pipeline.summary}
+            </p>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between pt-3 border-t border-border/50 text-xs text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <Shield size={12} />
+            Quality Gate:
+            <span className={decision === "BLOCK" ? "text-cyber-red" : "text-cyber-green"}>
+              {decision === "BLOCK" ? " Échec" : " Validé"}
             </span>
           </div>
-          <span>{pipeline.commit_sha?.slice(0, 7) || "—"}</span>
+
+          <div>
+            {critical > 0 || high > 0 || secretsFound
+              ? "Action requise"
+              : "Aucune action critique"}
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -179,7 +261,11 @@ export default function CICD() {
             GitHub Actions — Workflows de sécurité Shift-Left
           </p>
         </div>
-        <Button onClick={() => loadRuns(true)} className="gap-2 bg-cyber-violet hover:bg-cyber-violet-dark">
+
+        <Button
+          onClick={() => loadRuns(true)}
+          className="gap-2 bg-cyber-violet hover:bg-cyber-violet-dark"
+        >
           {loading ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
           Rafraîchir
         </Button>
@@ -204,7 +290,9 @@ export default function CICD() {
 
         <Card className="bg-card/50 border-cyber-border">
           <CardContent className="p-4 text-center">
-            <p className="text-2xl font-bold font-mono text-cyber-red">{stats?.blocked || 0}</p>
+            <p className="text-2xl font-bold font-mono text-cyber-red">
+              {stats?.blocked || 0}
+            </p>
             <p className="text-xs text-muted-foreground">Bloqués</p>
           </CardContent>
         </Card>
@@ -273,19 +361,29 @@ export default function CICD() {
       <div className="flex gap-2">
         <button
           onClick={() => setActiveTab("all")}
-          className={`px-3 py-2 rounded text-sm border ${activeTab === "all" ? "bg-cyber-panel border-cyber-violet" : "border-cyber-border"}`}
+          className={`px-3 py-2 rounded text-sm border ${
+            activeTab === "all" ? "bg-cyber-panel border-cyber-violet" : "border-cyber-border"
+          }`}
         >
           Tous
         </button>
         <button
           onClick={() => setActiveTab("blocked")}
-          className={`px-3 py-2 rounded text-sm border ${activeTab === "blocked" ? "bg-cyber-panel border-cyber-violet" : "border-cyber-border"}`}
+          className={`px-3 py-2 rounded text-sm border ${
+            activeTab === "blocked"
+              ? "bg-cyber-panel border-cyber-violet"
+              : "border-cyber-border"
+          }`}
         >
           Bloqués
         </button>
         <button
           onClick={() => setActiveTab("success")}
-          className={`px-3 py-2 rounded text-sm border ${activeTab === "success" ? "bg-cyber-panel border-cyber-violet" : "border-cyber-border"}`}
+          className={`px-3 py-2 rounded text-sm border ${
+            activeTab === "success"
+              ? "bg-cyber-panel border-cyber-violet"
+              : "border-cyber-border"
+          }`}
         >
           Succès
         </button>

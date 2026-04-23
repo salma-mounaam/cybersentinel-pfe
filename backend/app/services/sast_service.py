@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 import zipfile
+import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, unquote
@@ -47,12 +48,14 @@ class SASTOrchestrator:
         """
         Lance les 3 outils en parallèle et agrège les résultats.
         """
+        scan_id = uuid.uuid4().hex
         repo_path = str(Path(repo_path).resolve())
-        logger.info(f"M4 SAST scan démarré — {repo_path}")
+        logger.info(f"M4 SAST scan démarré — {repo_path} | scan_id={scan_id}")
 
         if not Path(repo_path).exists():
             logger.error(f"Chemin de scan introuvable: {repo_path}")
             return {
+                "scan_id": scan_id,
                 "total": 0,
                 "by_tool": {},
                 "by_severity": {},
@@ -97,6 +100,7 @@ class SASTOrchestrator:
                 finding.repo_name = repo_name
                 finding.commit_sha = commit_sha
                 finding.pr_number = pr_number
+                finding.scan_id = scan_id
 
                 try:
                     technique_id = self.mitre_engine.resolve_sast({
@@ -129,11 +133,13 @@ class SASTOrchestrator:
                 logger.warning(f"Création incident échouée pour finding {getattr(finding, 'id', None)}: {e}")
 
         stats = self._compute_stats(saved_findings)
+        stats["scan_id"] = scan_id
         stats["saved_ids"] = [f.id for f in saved_findings if getattr(f, "id", None) is not None]
         stats["critical_incidents"] = critical_count
 
         logger.info(
             f"M4 SAST terminé | "
+            f"scan_id={scan_id} | "
             f"Total={stats['total']} | "
             f"Critique={stats['by_severity'].get('CRITICAL', 0)} | "
             f"Incidents créés={critical_count}"

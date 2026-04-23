@@ -6,7 +6,11 @@
 const API_BASE =
   process.env.REACT_APP_API_URL?.replace(/\/$/, "") || "http://localhost:8000/api";
 
-async function parseJsonSafe<T>(res: Response, method: string, url: string): Promise<T> {
+async function parseJsonSafe<T>(
+  res: Response,
+  method: string,
+  url: string
+): Promise<T> {
   const text = await res.text();
 
   if (!res.ok) {
@@ -16,7 +20,9 @@ async function parseJsonSafe<T>(res: Response, method: string, url: string): Pro
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new Error(`${method} ${url} → réponse non JSON : ${text.slice(0, 200)}`);
+    throw new Error(
+      `${method} ${url} → réponse non JSON : ${text.slice(0, 200)}`
+    );
   }
 }
 
@@ -58,10 +64,15 @@ export const alertsAPI = {
 
   getAll: (params?: { severity?: string; limit?: number; offset?: number }) => {
     const q = new URLSearchParams();
+
     if (params?.severity) q.set("severity", params.severity);
-    if (params?.limit) q.set("limit", String(params.limit));
-    if (params?.offset) q.set("offset", String(params.offset));
-    return get<{ total: number; alerts: any[] }>(`/alerts/?${q.toString()}`);
+    if (params?.limit !== undefined) q.set("limit", String(params.limit));
+    if (params?.offset !== undefined) q.set("offset", String(params.offset));
+
+    const qs = q.toString();
+    return get<{ total: number; alerts: any[] }>(
+      `/alerts/${qs ? `?${qs}` : ""}`
+    );
   },
 
   getStats: () => get<any>("/alerts/stats"),
@@ -96,8 +107,18 @@ export const sastAPI = {
   scan: (repo_path: string, repo_name = "", commit_sha = "") =>
     post<any>("/sast/scan", { repo_path, repo_name, commit_sha }),
 
-  scanSync: (repo_path: string, repo_name = "", commit_sha = "") =>
-    post<any>("/sast/scan/sync", { repo_path, repo_name, commit_sha }),
+  scanSync: (
+    repo_path: string,
+    repo_name = "",
+    commit_sha = "",
+    pr_number?: number
+  ) =>
+    post<any>("/sast/scan/sync", {
+      repo_path,
+      repo_name,
+      commit_sha,
+      pr_number,
+    }),
 
   uploadScan: (file: File, project_name = "", commit_sha = "") => {
     const formData = new FormData();
@@ -107,19 +128,47 @@ export const sastAPI = {
     return postForm<any>("/sast/scan/upload", formData);
   },
 
+  getLatestScan: (repo_name?: string) => {
+    const q = new URLSearchParams();
+    if (repo_name) q.set("repo_name", repo_name);
+    const qs = q.toString();
+
+    return get<{ scan_id: string | null }>(
+      `/sast/latest-scan${qs ? `?${qs}` : ""}`
+    );
+  },
+
   getFindings: (params?: {
     tool?: string;
     severity?: string;
+    cwe?: string;
+    scan_id?: string;
     limit?: number;
+    offset?: number;
   }) => {
     const q = new URLSearchParams();
+
     if (params?.tool) q.set("tool", params.tool);
     if (params?.severity) q.set("severity", params.severity);
-    if (params?.limit) q.set("limit", String(params.limit));
-    return get<{ total: number; findings: any[] }>(`/sast/findings?${q.toString()}`);
+    if (params?.cwe) q.set("cwe", params.cwe);
+    if (params?.scan_id) q.set("scan_id", params.scan_id);
+    if (params?.limit !== undefined) q.set("limit", String(params.limit));
+    if (params?.offset !== undefined) q.set("offset", String(params.offset));
+
+    const qs = q.toString();
+    return get<{ total: number; findings: any[] }>(
+      `/sast/findings${qs ? `?${qs}` : ""}`
+    );
   },
 
-  getStats: () => get<any>("/sast/stats"),
+  getStats: (params?: { scan_id?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.scan_id) q.set("scan_id", params.scan_id);
+    const qs = q.toString();
+
+    return get<any>(`/sast/stats${qs ? `?${qs}` : ""}`);
+  },
+
   getById: (id: number) => get<any>(`/sast/findings/${id}`),
 
   qualityGate: (data: {
@@ -169,12 +218,19 @@ export const incidentsAPI = {
     offset?: number;
   }) => {
     const q = new URLSearchParams();
+
     if (params?.severity) q.set("severity", params.severity);
     if (params?.status) q.set("status", params.status);
     if (params?.technique_id) q.set("technique_id", params.technique_id);
-    if (params?.limit) q.set("limit", String(params.limit));
-    if (params?.offset) q.set("offset", String(params.offset));
-    return get<{ total: number; incidents: any[] }>(`/incidents/?${q.toString()}`);
+
+    const safeLimit =
+      params?.limit !== undefined ? Math.min(params.limit, 100) : undefined;
+
+    if (safeLimit !== undefined) q.set("limit", String(safeLimit));
+    if (params?.offset !== undefined) q.set("offset", String(params.offset));
+
+    const qs = q.toString();
+    return get<any>(`/incidents/${qs ? `?${qs}` : ""}`);
   },
 
   getStats: () => get<any>("/incidents/stats"),
@@ -220,7 +276,8 @@ export const cicdAPI = {
 export const healthAPI = {
   check: async () => {
     const res = await fetch(
-      process.env.REACT_APP_API_ROOT?.replace(/\/$/, "") || "http://localhost:8000/health"
+      process.env.REACT_APP_API_ROOT?.replace(/\/$/, "") ||
+        "http://localhost:8000/health"
     );
     return res.json();
   },

@@ -26,6 +26,16 @@ GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "").strip()
 
 
 # ============================================================
+# Helpers
+# ============================================================
+
+def _push_pipeline_run(run: Dict[str, Any]) -> None:
+    _pipeline_runs.insert(0, run)
+    if len(_pipeline_runs) > 100:
+        _pipeline_runs.pop()
+
+
+# ============================================================
 # Webhook interne GitHub Actions
 # ============================================================
 
@@ -46,13 +56,22 @@ async def receive_cicd_webhook(request: Request):
         "pr_number": data.get("pr_number"),
         "commit_sha": str(data.get("commit_sha", ""))[:8],
         "repo": data.get("repo"),
+        "branch": data.get("branch", "main"),
         "timestamp": datetime.utcnow().isoformat(),
         "source": "internal_workflow",
+
+        "critical_count": data.get("critical_count", 0),
+        "high_count": data.get("high_count", 0),
+        "medium_count": data.get("medium_count", 0),
+        "low_count": data.get("low_count", 0),
+        "secrets_found": data.get("secrets_found", False),
+        "total_findings": data.get("total_findings", 0),
+
+        "message": data.get("message", ""),
+        "summary": data.get("summary", ""),
     }
 
-    _pipeline_runs.insert(0, run)
-    if len(_pipeline_runs) > 100:
-        _pipeline_runs.pop()
+    _push_pipeline_run(run)
 
     blocked = run["decision"] == "BLOCK"
     if blocked:
@@ -283,6 +302,14 @@ async def submit_scan_results(request: Request):
         1 for f in all_findings
         if f.severity == SASTSeverity.HIGH
     )
+    medium_count = sum(
+        1 for f in all_findings
+        if f.severity == SASTSeverity.MEDIUM
+    )
+    low_count = sum(
+        1 for f in all_findings
+        if f.severity == SASTSeverity.LOW
+    )
     secrets_found = any(
         f.tool == SASTTool.GITLEAKS
         for f in all_findings
@@ -292,10 +319,13 @@ async def submit_scan_results(request: Request):
         "decision": "BLOCK" if (critical_count >= 1 or high_count > 5 or secrets_found) else "PASS",
         "critical_count": critical_count,
         "high_count": high_count,
+        "medium_count": medium_count,
+        "low_count": low_count,
         "secrets_found": secrets_found,
         "total_findings": len(all_findings),
         "saved_ids": [f.id for f in saved_findings if getattr(f, "id", None) is not None],
         "repo_name": repo_name,
+        "branch": branch,
         "commit_sha": commit_sha,
         "pr_number": pr_number,
     }
@@ -306,13 +336,25 @@ async def submit_scan_results(request: Request):
         "pr_number": pr_number,
         "commit_sha": commit_sha,
         "repo": repo_name,
+        "branch": branch,
         "timestamp": datetime.utcnow().isoformat(),
         "source": "github_actions_submit",
-    }
-    _pipeline_runs.insert(0, run)
 
-    if len(_pipeline_runs) > 100:
-        _pipeline_runs.pop()
+        "critical_count": critical_count,
+        "high_count": high_count,
+        "medium_count": medium_count,
+        "low_count": low_count,
+        "secrets_found": secrets_found,
+        "total_findings": len(all_findings),
+
+        "message": (
+            "Pipeline bloquée par quality gate"
+            if gate_result["decision"] == "BLOCK"
+            else "Pipeline validée"
+        ),
+        "summary": f"{len(all_findings)} findings analysés",
+    }
+    _push_pipeline_run(run)
 
     logger.info(
         f"Submit results terminé | repo={repo_name} | "
@@ -372,12 +414,14 @@ async def get_pipeline_runs():
     total = len(_pipeline_runs)
     blocked = sum(1 for r in _pipeline_runs if r["decision"] == "BLOCK")
     passed = sum(1 for r in _pipeline_runs if r["decision"] == "PASS")
+    running = sum(1 for r in _pipeline_runs if r["decision"] == "RUNNING")
     block_rate = round((blocked / max(total, 1)) * 100, 1)
 
     return {
         "total": total,
         "blocked": blocked,
         "passed": passed,
+        "running": running,
         "block_rate": block_rate,
         "h5_status": block_rate >= 100.0 if blocked > 0 else None,
         "runs": _pipeline_runs[:50],
@@ -526,13 +570,25 @@ async def _scan_github_repo(
                 "pr_number": pr_number,
                 "commit_sha": commit_sha[:8] if commit_sha else "",
                 "repo": repo_name,
+                "branch": branch,
                 "timestamp": datetime.utcnow().isoformat(),
                 "source": "github_webhook_scan",
-            }
-            _pipeline_runs.insert(0, run)
 
-            if len(_pipeline_runs) > 100:
-                _pipeline_runs.pop()
+                "critical_count": results.get("by_severity", {}).get("CRITICAL", 0),
+                "high_count": results.get("by_severity", {}).get("HIGH", 0),
+                "medium_count": results.get("by_severity", {}).get("MEDIUM", 0),
+                "low_count": results.get("by_severity", {}).get("LOW", 0),
+                "secrets_found": results.get("has_secrets", False),
+                "total_findings": results.get("total", 0),
+
+                "message": (
+                    "Pipeline bloquée par quality gate"
+                    if decision == "BLOCK"
+                    else "Pipeline validée"
+                ),
+                "summary": f"{results.get('total', 0)} findings détectés",
+            }
+            _push_pipeline_run(run)
 
         except asyncio.TimeoutError:
             logger.error(f"Timeout clone repo {repo_name}")

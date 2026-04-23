@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { SevBadge } from "../components/common";
 import {
   Play,
@@ -37,7 +38,7 @@ function normalizeSeverity(sev?: string) {
   return "low";
 }
 
-function FindingRow({ finding, index }: { finding: any; index: number }) {
+function FindingRow({ finding }: { finding: any }) {
   const severity = normalizeSeverity(finding.severity);
 
   return (
@@ -88,12 +89,18 @@ function FindingRow({ finding, index }: { finding: any; index: number }) {
             <span className="flex items-center gap-1">
               <FileCode size={12} />
               {finding.file_path || finding.file || "—"}
-              {finding.line ? `:${finding.line}` : ""}
-              {finding.column ? `:${finding.column}` : ""}
+              {finding.line_number ? `:${finding.line_number}` : ""}
+              {finding.col_start ? `:${finding.col_start}` : ""}
             </span>
 
             {(finding.rule_id || finding.ruleId) && (
               <span className="font-mono">{finding.rule_id || finding.ruleId}</span>
+            )}
+
+            {finding.scan_id && (
+              <span className="font-mono text-[10px] opacity-70">
+                scan: {finding.scan_id.slice(0, 8)}
+              </span>
             )}
           </div>
         </div>
@@ -145,21 +152,27 @@ function ResultCard({
 }
 
 export default function SASTScanner() {
+  const navigate = useNavigate();
+
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
-  const [scanning, setScanning] = useState(false);
-  const [scanProgress, setScanProgress] = useState(0);
 
   const [stats, setStats] = useState<any>(null);
   const [data, setData] = useState<any[]>([]);
+  const [scanId, setScanId] = useState<string | null>(null);
 
   const loadData = async () => {
     setLoading(true);
     try {
+      const latest = await sastAPI.getLatestScan();
+      const currentScanId = latest?.scan_id || null;
+      setScanId(currentScanId);
+
       const [statsRes, findingsRes] = await Promise.all([
-        sastAPI.getStats(),
-        sastAPI.getFindings({ limit: 200 }),
+        sastAPI.getStats(currentScanId ? { scan_id: currentScanId } : {}),
+        sastAPI.getFindings(currentScanId ? { limit: 200, scan_id: currentScanId } : { limit: 200 }),
       ]);
+
       setStats(statsRes);
       setData(findingsRes.findings || []);
     } catch (e) {
@@ -173,22 +186,12 @@ export default function SASTScanner() {
     loadData();
   }, []);
 
-  const handleLaunchScan = async () => {
-    setScanning(true);
-    setScanProgress(15);
-
-    try {
-      await sastAPI.scanSync("/tmp/juice-shop", "manual-scan");
-      setScanProgress(100);
-      await loadData();
-    } catch (e) {
-      console.error("SAST scan error:", e);
-    } finally {
-      setTimeout(() => {
-        setScanning(false);
-        setScanProgress(0);
-      }, 700);
-    }
+  const handleLaunchScan = () => {
+    navigate("/scan-code", {
+      state: {
+        autoStartSast: true,
+      },
+    });
   };
 
   const filteredFindings = useMemo(() => {
@@ -196,7 +199,9 @@ export default function SASTScanner() {
       const text = searchQuery.toLowerCase();
       return (
         (f.message || f.title || "").toLowerCase().includes(text) ||
-        (f.file_path || f.file || "").toLowerCase().includes(text)
+        (f.file_path || f.file || "").toLowerCase().includes(text) ||
+        (f.rule_id || "").toLowerCase().includes(text) ||
+        (f.cwe || "").toLowerCase().includes(text)
       );
     });
   }, [data, searchQuery]);
@@ -212,66 +217,87 @@ export default function SASTScanner() {
           <p className="text-sm text-muted-foreground">
             Semgrep + Trivy + Gitleaks — Analyse statique de code
           </p>
+          {scanId && (
+            <p className="text-xs text-muted-foreground mt-1 font-mono">
+              Dernier scan : {scanId}
+            </p>
+          )}
         </div>
 
         <Button
           onClick={handleLaunchScan}
-          disabled={scanning}
           className="gap-2 bg-cyber-violet hover:bg-cyber-violet-dark"
         >
-          {scanning ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
-          {scanning ? "Scan en cours..." : "Lancer un scan"}
+          <Play size={16} />
+          Lancer un scan
         </Button>
       </div>
 
-      {(scanning || loading) && (
+      {loading && (
         <Card className="bg-card/50 border-cyber-violet/30">
           <CardContent className="p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm font-medium">
-                {scanning ? "Scan en cours..." : "Chargement..."}
-              </span>
-              <span className="text-sm font-mono">{scanProgress}%</span>
-            </div>
-
-            <div className="w-full h-2 rounded bg-muted overflow-hidden">
-              <div
-                className="h-full bg-cyber-violet transition-all duration-300"
-                style={{ width: `${scanProgress}%` }}
-              />
+            <div className="flex items-center gap-2 text-sm">
+              <Loader2 size={16} className="animate-spin" />
+              Chargement...
             </div>
           </CardContent>
         </Card>
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <ResultCard tool="semgrep" count={byTool.semgrep || 0} icon={scannerIcons.semgrep} color={scannerColors.semgrep} />
-        <ResultCard tool="trivy" count={byTool.trivy || 0} icon={scannerIcons.trivy} color={scannerColors.trivy} />
-        <ResultCard tool="gitleaks" count={byTool.gitleaks || 0} icon={scannerIcons.gitleaks} color={scannerColors.gitleaks} />
+        <ResultCard
+          tool="semgrep"
+          count={byTool.semgrep || 0}
+          icon={scannerIcons.semgrep}
+          color={scannerColors.semgrep}
+        />
+        <ResultCard
+          tool="trivy"
+          count={byTool.trivy || 0}
+          icon={scannerIcons.trivy}
+          color={scannerColors.trivy}
+        />
+        <ResultCard
+          tool="gitleaks"
+          count={byTool.gitleaks || 0}
+          icon={scannerIcons.gitleaks}
+          color={scannerColors.gitleaks}
+        />
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <Card className="bg-card/50 border-cyber-border">
           <CardContent className="p-4 text-center">
-            <p className="text-2xl font-bold font-mono text-cyber-red">{bySeverity.CRITICAL || 0}</p>
+            <p className="text-2xl font-bold font-mono text-cyber-red">
+              {bySeverity.CRITICAL || 0}
+            </p>
             <p className="text-xs text-muted-foreground">Critiques</p>
           </CardContent>
         </Card>
+
         <Card className="bg-card/50 border-cyber-border">
           <CardContent className="p-4 text-center">
-            <p className="text-2xl font-bold font-mono text-cyber-orange">{bySeverity.HIGH || 0}</p>
+            <p className="text-2xl font-bold font-mono text-cyber-orange">
+              {bySeverity.HIGH || 0}
+            </p>
             <p className="text-xs text-muted-foreground">Élevées</p>
           </CardContent>
         </Card>
+
         <Card className="bg-card/50 border-cyber-border">
           <CardContent className="p-4 text-center">
-            <p className="text-2xl font-bold font-mono text-cyber-blue">{bySeverity.MEDIUM || 0}</p>
+            <p className="text-2xl font-bold font-mono text-cyber-blue">
+              {bySeverity.MEDIUM || 0}
+            </p>
             <p className="text-xs text-muted-foreground">Moyennes</p>
           </CardContent>
         </Card>
+
         <Card className="bg-card/50 border-cyber-border">
           <CardContent className="p-4 text-center">
-            <p className="text-2xl font-bold font-mono text-cyber-green">{bySeverity.LOW || 0}</p>
+            <p className="text-2xl font-bold font-mono text-cyber-green">
+              {bySeverity.LOW || 0}
+            </p>
             <p className="text-xs text-muted-foreground">Faibles</p>
           </CardContent>
         </Card>
@@ -281,11 +307,16 @@ export default function SASTScanner() {
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between gap-4">
             <div className="relative flex-1 max-w-md">
-              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Search
+                size={16}
+                className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+              />
               <input
                 placeholder="Rechercher une vulnérabilité..."
                 value={searchQuery}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  setSearchQuery(e.target.value)
+                }
                 className="w-full pl-10 pr-3 py-2 rounded-md bg-cyber-panel border border-cyber-border text-sm outline-none"
               />
             </div>
@@ -307,8 +338,14 @@ export default function SASTScanner() {
           <div className="max-h-96 overflow-auto">
             <div className="space-y-2">
               {filteredFindings.map((finding, index) => (
-                <FindingRow key={finding.id || index} finding={finding} index={index} />
+                <FindingRow key={finding.id || index} finding={finding} />
               ))}
+
+              {!loading && filteredFindings.length === 0 && (
+                <div className="text-sm text-muted-foreground py-6 text-center">
+                  Aucun finding pour le dernier scan.
+                </div>
+              )}
             </div>
           </div>
         </CardContent>
@@ -321,16 +358,17 @@ export default function SASTScanner() {
         <CardContent>
           <div className="bg-cyber-darker rounded-lg p-4 font-mono text-xs overflow-auto">
             <pre className="text-muted-foreground">
-{JSON.stringify(
-  {
-    total: stats?.total || 0,
-    by_tool: stats?.by_tool || {},
-    by_severity: stats?.by_severity || {},
-    sample_results: filteredFindings.slice(0, 5),
-  },
-  null,
-  2
-)}
+              {JSON.stringify(
+                {
+                  scan_id: scanId,
+                  total: stats?.total || 0,
+                  by_tool: stats?.by_tool || {},
+                  by_severity: stats?.by_severity || {},
+                  sample_results: filteredFindings.slice(0, 5),
+                },
+                null,
+                2
+              )}
             </pre>
           </div>
         </CardContent>

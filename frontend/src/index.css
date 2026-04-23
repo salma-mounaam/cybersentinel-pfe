@@ -238,3 +238,14 @@
     transform: scale(1.3);
   }
 }
+input::placeholder,
+textarea::placeholder {
+  color: var(--cs-text3);
+  opacity: 1;
+}
+
+input,
+select,
+textarea {
+  color-scheme: dark;
+}

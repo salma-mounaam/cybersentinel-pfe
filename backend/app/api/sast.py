@@ -136,6 +136,7 @@ async def get_findings(
     tool: Optional[SASTTool] = None,
     severity: Optional[SASTSeverity] = None,
     cwe: Optional[str] = None,
+    scan_id: Optional[str] = None,
     limit: int = Query(default=50, le=500),
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
@@ -143,7 +144,7 @@ async def get_findings(
     """
     Récupère les findings SAST avec filtres.
     """
-    query = select(SASTFinding).order_by(desc(SASTFinding.cvss_score))
+    query = select(SASTFinding).order_by(desc(SASTFinding.cvss_score), desc(SASTFinding.created_at))
 
     if tool:
         query = query.where(SASTFinding.tool == tool)
@@ -151,13 +152,18 @@ async def get_findings(
         query = query.where(SASTFinding.severity == severity)
     if cwe:
         query = query.where(SASTFinding.cwe == cwe)
+    if scan_id:
+        query = query.where(SASTFinding.scan_id == scan_id)
+
+    count_query = select(func.count()).select_from(query.subquery())
+    total = await db.scalar(count_query)
 
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     findings = result.scalars().all()
 
     return {
-        "total": len(findings),
+        "total": total or 0,
         "findings": [_finding_to_dict(f) for f in findings],
     }
 
@@ -166,31 +172,46 @@ async def get_findings(
 # KPIs SAST
 # ============================================================
 @router.get("/stats")
-async def get_sast_stats(db: AsyncSession = Depends(get_db)):
+async def get_sast_stats(
+    scan_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """
     KPIs SAST pour la page Overview.
     """
-    total = await db.scalar(select(func.count(SASTFinding.id)))
+    base_query = select(SASTFinding)
+
+    if scan_id:
+        base_query = base_query.where(SASTFinding.scan_id == scan_id)
+
+    total = await db.scalar(
+        select(func.count()).select_from(base_query.subquery())
+    )
 
     by_tool = {}
     for tool in SASTTool:
-        count = await db.scalar(
-            select(func.count(SASTFinding.id)).where(SASTFinding.tool == tool)
-        )
+        q = select(func.count(SASTFinding.id)).where(SASTFinding.tool == tool)
+        if scan_id:
+            q = q.where(SASTFinding.scan_id == scan_id)
+        count = await db.scalar(q)
         by_tool[tool.value] = count or 0
 
     by_severity = {}
     for sev in SASTSeverity:
-        count = await db.scalar(
-            select(func.count(SASTFinding.id)).where(SASTFinding.severity == sev)
-        )
+        q = select(func.count(SASTFinding.id)).where(SASTFinding.severity == sev)
+        if scan_id:
+            q = q.where(SASTFinding.scan_id == scan_id)
+        count = await db.scalar(q)
         by_severity[sev.value] = count or 0
 
-    confirmed_by_dast = await db.scalar(
-        select(func.count(SASTFinding.id)).where(SASTFinding.dast_confirmed == 1)
-    )
+    q = select(func.count(SASTFinding.id)).where(SASTFinding.dast_confirmed == 1)
+    if scan_id:
+        q = q.where(SASTFinding.scan_id == scan_id)
+
+    confirmed_by_dast = await db.scalar(q)
 
     return {
+        "scan_id": scan_id,
         "total": total or 0,
         "by_tool": by_tool,
         "by_severity": by_severity,
@@ -198,6 +219,32 @@ async def get_sast_stats(db: AsyncSession = Depends(get_db)):
         "critical_count": by_severity.get("CRITICAL", 0),
         "secrets_found": by_tool.get("gitleaks", 0),
     }
+
+
+# ============================================================
+# Dernier scan
+# ============================================================
+@router.get("/latest-scan")
+async def get_latest_scan(
+    repo_name: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(SASTFinding.scan_id, SASTFinding.created_at).where(
+        SASTFinding.scan_id.is_not(None)
+    )
+
+    if repo_name:
+        query = query.where(SASTFinding.repo_name == repo_name)
+
+    query = query.order_by(desc(SASTFinding.created_at))
+
+    result = await db.execute(query)
+    row = result.first()
+
+    if not row:
+        return {"scan_id": None}
+
+    return {"scan_id": row[0]}
 
 
 # ============================================================
@@ -271,16 +318,22 @@ async def evaluate_quality_gate(payload: dict):
 def _finding_to_dict(f: SASTFinding) -> dict:
     return {
         "id": f.id,
+        "scan_id": f.scan_id,
         "tool": f.tool.value if f.tool else None,
         "severity": f.severity.value if f.severity else None,
         "file_path": f.file_path,
         "line_number": f.line_number,
+        "line_start": f.line_start,
+        "line_end": f.line_end,
+        "col_start": f.col_start,
+        "col_end": f.col_end,
         "rule_id": f.rule_id,
         "cwe": f.cwe,
         "cve": f.cve,
         "cvss_score": f.cvss_score,
         "title": f.title,
         "description": f.description,
+        "message": f.message,
         "fix_version": f.fix_version,
         "technique_id": f.technique_id,
         "technique_name": f.technique_name,
