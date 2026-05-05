@@ -5,6 +5,8 @@
 # V = CVSS Score [0-10]
 # E = Exploitabilité DAST [0 ou 10]
 # C = Criticité Asset [0-10]
+# NOUVEAU :
+#   [LLM] attack_type Llama intégré dans titre + description incident
 # ============================================================
 
 import json
@@ -27,9 +29,9 @@ logger = logging.getLogger(__name__)
 # SLA par niveau de sévérité
 SLA_MAP = {
     SeverityLevel.CRITIQUE: timedelta(hours=1),
-    SeverityLevel.ELEVE: timedelta(hours=4),
-    SeverityLevel.MOYEN: timedelta(hours=48),
-    SeverityLevel.FAIBLE: timedelta(days=14),
+    SeverityLevel.ELEVE:    timedelta(hours=4),
+    SeverityLevel.MOYEN:    timedelta(hours=48),
+    SeverityLevel.FAIBLE:   timedelta(days=14),
 }
 
 # Criticité par défaut des assets connus
@@ -45,7 +47,7 @@ DEFAULT_ASSET_CRITICALITY = {
 
 # Mapping optionnel IP -> criticité
 IP_CRITICALITY_MAP = {
-    "10.0.0.5": 9.0,
+    "10.0.0.5":  9.0,
     "10.0.0.10": 8.0,
     "10.0.0.20": 7.0,
 }
@@ -76,24 +78,19 @@ class RiskScoringEngine:
 
     def compute_score_r(
         self,
-        anomaly_score: float = 0.0,
-        cvss_score: float = 0.0,
-        dast_confirmed: bool = False,
+        anomaly_score:     float = 0.0,
+        cvss_score:        float = 0.0,
+        dast_confirmed:    bool  = False,
         asset_criticality: float = 5.0
     ) -> dict:
-        """
-        Calcule le score R et détermine le niveau de sévérité.
-        """
+        """Calcule le score R et détermine le niveau de sévérité."""
 
-        # Sécurisation bornes 0..10
-        anomaly_score = max(0.0, min(float(anomaly_score), 10.0))
-        cvss_score = max(0.0, min(float(cvss_score), 10.0))
+        anomaly_score     = max(0.0, min(float(anomaly_score),     10.0))
+        cvss_score        = max(0.0, min(float(cvss_score),        10.0))
         asset_criticality = max(0.0, min(float(asset_criticality), 10.0))
 
-        # Composant E : binaire 0 ou 10
         e_score = 10.0 if dast_confirmed else 0.0
 
-        # Poids unifiés depuis settings
         w_a = settings.SCORE_R_WEIGHT_A
         w_v = settings.SCORE_R_WEIGHT_V
         w_e = settings.SCORE_R_WEIGHT_E
@@ -117,12 +114,12 @@ class RiskScoringEngine:
             severity = SeverityLevel.FAIBLE
 
         return {
-            "score_r": r,
-            "score_a": round(anomaly_score, 2),
-            "score_v": round(cvss_score, 2),
-            "score_e": e_score,
-            "score_c": round(asset_criticality, 2),
-            "severity": severity.value,
+            "score_r":   r,
+            "score_a":   round(anomaly_score,     2),
+            "score_v":   round(cvss_score,        2),
+            "score_e":   e_score,
+            "score_c":   round(asset_criticality, 2),
+            "severity":  severity.value,
             "formula": (
                 f"R = {w_a}x{anomaly_score:.1f} + "
                 f"{w_v}x{cvss_score:.1f} + "
@@ -132,10 +129,7 @@ class RiskScoringEngine:
         }
 
     def get_asset_criticality(self, asset_ip: str = "", asset_name: str = "") -> float:
-        """
-        Retourne la criticité d'un asset [0-10].
-        Cherche d'abord par IP, puis par nom.
-        """
+        """Retourne la criticité d'un asset [0-10]."""
         if asset_ip and asset_ip in IP_CRITICALITY_MAP:
             return IP_CRITICALITY_MAP[asset_ip]
 
@@ -154,6 +148,7 @@ class RiskScoringEngine:
         """
         Crée un incident depuis une alerte IDS fusionnée (M3).
         Cherche des findings SAST corrélés pour enrichir le score R.
+        [LLM] attack_type intégré dans titre et description.
         """
 
         anomaly_score = max(0.0, min((alert.confidence or 0.0) * 10.0, 10.0))
@@ -163,11 +158,11 @@ class RiskScoringEngine:
             alert.technique_id
         )
 
-        cvss_score = 0.0
+        cvss_score     = 0.0
         dast_confirmed = False
 
         if sast_findings:
-            cvss_score = max((f.cvss_score or 0.0) for f in sast_findings)
+            cvss_score     = max((f.cvss_score or 0.0) for f in sast_findings)
             dast_confirmed = any(bool(getattr(f, "dast_confirmed", False)) for f in sast_findings)
         else:
             mitre_data = await self.mitre_engine.enrich_by_technique_id(
@@ -180,7 +175,7 @@ class RiskScoringEngine:
             alert.dest_ip or ""
         )
 
-        score_result = self.compute_score_r(
+        score_result  = self.compute_score_r(
             anomaly_score=anomaly_score,
             cvss_score=cvss_score,
             dast_confirmed=dast_confirmed,
@@ -188,10 +183,9 @@ class RiskScoringEngine:
         )
 
         severity_enum = SeverityLevel(score_result["severity"])
+        title         = self._build_incident_title(alert, severity_enum)
 
-        title = self._build_incident_title(alert, severity_enum)
-
-        now = datetime.now(timezone.utc)
+        now          = datetime.now(timezone.utc)
         sla_deadline = now + SLA_MAP.get(severity_enum, timedelta(days=14))
 
         incident = Incident(
@@ -232,9 +226,11 @@ class RiskScoringEngine:
             await db.refresh(incident)
 
         logger.info(
-            f"📋 Incident créé | #{incident.id} | "
-            f"R={incident.score_r} | {incident.severity.value} | "
-            f"{title}"
+            "📋 Incident créé | #%s | R=%s | %s | %s",
+            incident.id,
+            incident.score_r,
+            incident.severity.value,
+            title,
         )
 
         await self._notify_incident(incident)
@@ -245,15 +241,13 @@ class RiskScoringEngine:
         return incident
 
     async def create_incident_from_sast(self, finding: SASTFinding) -> Optional[Incident]:
-        """
-        Crée un incident depuis un finding SAST critique.
-        """
+        """Crée un incident depuis un finding SAST critique."""
         if not finding.cvss_score or finding.cvss_score < 7.0:
             return None
 
         asset_criticality = self.get_asset_criticality("", finding.repo_name or "")
 
-        score_result = self.compute_score_r(
+        score_result  = self.compute_score_r(
             anomaly_score=0.0,
             cvss_score=finding.cvss_score,
             dast_confirmed=bool(getattr(finding, "dast_confirmed", False)),
@@ -262,7 +256,7 @@ class RiskScoringEngine:
 
         severity_enum = SeverityLevel(score_result["severity"])
 
-        now = datetime.now(timezone.utc)
+        now          = datetime.now(timezone.utc)
         sla_deadline = now + SLA_MAP.get(severity_enum, timedelta(days=14))
 
         incident = Incident(
@@ -323,10 +317,7 @@ class RiskScoringEngine:
 
     @staticmethod
     def validate_h4(computed_scores: list, expert_scores: list) -> dict:
-        """
-        Valide H4 : corrélation score R vs évaluation experte.
-        """
-
+        """Valide H4 : corrélation score R vs évaluation experte."""
         import numpy as np
 
         if len(computed_scores) != len(expert_scores):
@@ -336,27 +327,31 @@ class RiskScoringEngine:
             return {"error": "Pas assez de données (minimum 2 incidents)"}
 
         x = np.array(computed_scores, dtype=float)
-        y = np.array(expert_scores, dtype=float)
+        y = np.array(expert_scores,   dtype=float)
 
         if np.std(x) == 0 or np.std(y) == 0:
-            return {"error": "Impossible de calculer Pearson: variance nulle dans une série"}
+            return {"error": "Impossible de calculer Pearson: variance nulle"}
 
         correlation = float(np.corrcoef(x, y)[0, 1])
 
         return {
-            "pearson_r": round(correlation, 4),
-            "h4_validated": correlation >= 0.80,
-            "target": "Pearson r >= 0.80",
-            "n_incidents": len(computed_scores),
+            "pearson_r":     round(correlation, 4),
+            "h4_validated":  correlation >= 0.80,
+            "target":        "Pearson r >= 0.80",
+            "n_incidents":   len(computed_scores),
             "mean_computed": round(float(np.mean(x)), 2),
-            "mean_expert": round(float(np.mean(y)), 2),
+            "mean_expert":   round(float(np.mean(y)), 2),
         }
 
     # ============================================================
     # Helpers privés
     # ============================================================
 
-    async def _find_related_sast(self, asset_ip: str, technique_id: Optional[str]) -> List[SASTFinding]:
+    async def _find_related_sast(
+        self,
+        asset_ip: str,
+        technique_id: Optional[str]
+    ) -> List[SASTFinding]:
         """Cherche les findings SAST corrélés par technique MITRE."""
         if not technique_id:
             return []
@@ -371,27 +366,54 @@ class RiskScoringEngine:
                 )
                 return list(result.scalars().all())
         except Exception as e:
-            logger.error(f"Erreur lookup SAST: {e}", exc_info=True)
+            logger.error("Erreur lookup SAST: %s", e, exc_info=True)
             return []
 
     def _build_incident_title(self, alert: Alert, severity: SeverityLevel) -> str:
-        """Construit un titre lisible pour l'incident."""
-        technique = alert.technique_name or alert.technique_id or "Menace inconnue"
-        src = alert.src_ip or "IP inconnue"
+        """
+        [LLM] Construit un titre lisible avec attack_type Llama.
+        Avant : "Exploit Public-Facing Application — IP → IP"
+        Après : "BruteForce SSH — 10.21.1.54 → 10.16.2.150"
+        """
+        # Utiliser attack_type LLM si disponible, sinon technique MITRE
+        attack_label = (
+            getattr(alert, "attack_type", None)
+            or alert.technique_name
+            or alert.technique_id
+            or "Menace inconnue"
+        )
+        src = alert.src_ip  or "IP inconnue"
         dst = alert.dest_ip or "asset inconnu"
-        return f"{technique} — {src} → {dst}"
+        sig = alert.signature_name or ""
 
-    def _build_description(self, alert: Alert, score_result: dict, sast_findings: list) -> str:
-        """Génère la description détaillée de l'incident."""
+        # Titre enrichi : "BruteForce SSH — 10.21.1.54 → 10.16.2.150"
+        if sig:
+            return f"{attack_label} — {src} → {dst}"
+        return f"{attack_label} — {src} → {dst}"
+
+    def _build_description(
+        self,
+        alert: Alert,
+        score_result: dict,
+        sast_findings: list
+    ) -> str:
+        """
+        [LLM] Description enrichie avec attack_type et signature Suricata.
+        """
+        attack_type = getattr(alert, "attack_type", None) or "Unknown"
+
         lines = [
             f"Score R = {score_result['score_r']} ({score_result['severity']})",
             f"Formule : {score_result['formula']}",
+            "",
+            # [LLM] Type d'attaque classifié par Llama
+            f"Type d'attaque (LLM) : {attack_type}",
+            f"Signature : {alert.signature_name}",
             "",
             f"Source principale : {alert.source.value if getattr(alert, 'source', None) else 'IDS'}",
             f"Technique MITRE : {alert.technique_id} — {alert.technique_name}",
             f"Tactique : {alert.tactic}",
             f"Flux : {alert.src_ip}:{alert.src_port} → {alert.dest_ip}:{alert.dest_port} ({alert.protocol})",
-            f"Signature : {alert.signature_name}",
             f"Confiance fusion : {alert.confidence}",
         ]
 
@@ -408,61 +430,53 @@ class RiskScoringEngine:
         return "\n".join(lines)
 
     async def _notify_incident(self, incident: Incident):
-        """
-        Publie l'incident dans Redis → WebSocket M9.
-        Channel de sortie: channel:incidents
-        """
+        """Publie l'incident dans Redis → WebSocket M9."""
         try:
             r = await self._get_redis()
             payload = json.dumps({
-                "type": "incident",
-                "id": incident.id,
-                "title": incident.title,
-                "status": incident.status.value if incident.status else None,
-                "severity": incident.severity.value if incident.severity else None,
-                "score_r": incident.score_r,
-                "score_a": incident.score_a,
-                "score_v": incident.score_v,
-                "score_e": incident.score_e,
-                "score_c": incident.score_c,
+                "type":         "incident",
+                "id":           incident.id,
+                "title":        incident.title,
+                "status":       incident.status.value   if incident.status   else None,
+                "severity":     incident.severity.value if incident.severity else None,
+                "score_r":      incident.score_r,
+                "score_a":      incident.score_a,
+                "score_v":      incident.score_v,
+                "score_e":      incident.score_e,
+                "score_c":      incident.score_c,
                 "technique_id": incident.technique_id,
-                "tactic": incident.tactic,
-                "asset_ip": incident.asset_ip,
+                "tactic":       incident.tactic,
+                "asset_ip":     incident.asset_ip,
                 "sla_deadline": incident.sla_deadline.isoformat() if incident.sla_deadline else None,
-                "detected_at": incident.detected_at.isoformat() if incident.detected_at else None,
+                "detected_at":  incident.detected_at.isoformat()  if incident.detected_at  else None,
             })
             await r.publish("channel:incidents", payload)
         except Exception as e:
-            logger.error(f"Erreur notification incident: {e}", exc_info=True)
+            logger.error("Erreur notification incident: %s", e, exc_info=True)
 
     async def _notify_critical(self, incident: Incident):
-        """
-        Notification spéciale pour les incidents CRITIQUES.
-        """
+        """Notification spéciale pour les incidents CRITIQUES."""
         try:
             r = await self._get_redis()
             payload = json.dumps({
-                "type": "CRITICAL_ALERT",
-                "id": incident.id,
-                "title": incident.title,
-                "score_r": incident.score_r,
-                "sla": "< 1 heure",
+                "type":       "CRITICAL_ALERT",
+                "id":         incident.id,
+                "title":      incident.title,
+                "score_r":    incident.score_r,
+                "sla":        "< 1 heure",
                 "apt_groups": incident.apt_groups,
-                "mitre_url": incident.mitre_url,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mitre_url":  incident.mitre_url,
+                "timestamp":  datetime.now(timezone.utc).isoformat(),
             })
 
             await r.publish("channel:critical", payload)
-
-            await r.setex(
-                f"critical:{incident.id}",
-                86400,
-                payload
-            )
+            await r.setex(f"critical:{incident.id}", 86400, payload)
 
             logger.critical(
-                f"🚨 INCIDENT CRITIQUE #{incident.id} | "
-                f"R={incident.score_r} | {incident.title} | SLA < 1 heure"
+                "🚨 INCIDENT CRITIQUE #%s | R=%s | %s | SLA < 1 heure",
+                incident.id,
+                incident.score_r,
+                incident.title,
             )
         except Exception as e:
-            logger.error(f"Erreur notification critique: {e}", exc_info=True)
+            logger.error("Erreur notification critique: %s", e, exc_info=True)

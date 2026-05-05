@@ -4,6 +4,7 @@
 #   main-net    : services principaux
 #   mgmt-net    : canal backend ↔ ZAP
 #   sandbox-net : cibles DAST (internal:true — ZERO internet)
+# FIX : command Suricata — pointe vers /etc/suricata/rules (volume monté)
 # ============================================================
 
 services:
@@ -79,7 +80,7 @@ services:
       - ./data:/app/data
       - ./data/dast_captures:/shared/dast_captures
       - ml_models:/app/data/models
-      - /var/log/suricata:/var/log/suricata:ro
+      - suricata_logs:/var/log/suricata:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - main-net
@@ -183,6 +184,9 @@ services:
 
   # ──────────────────────────────────────────────────────
   # SURICATA IDS (M1)
+  # FIX : command pointe vers /etc/suricata/rules (volume monté)
+  # Avant : règles cherchées dans /var/lib/suricata/rules (non persistant)
+  # Après : règles lues depuis ./suricata/rules monté en volume
   # ──────────────────────────────────────────────────────
   suricata:
     image: jasonish/suricata:latest
@@ -197,9 +201,12 @@ services:
       - ./suricata/rules:/etc/suricata/rules
       - ./suricata/suricata.yaml:/etc/suricata/suricata.yaml
       - suricata_logs:/var/log/suricata
-    command: -i eth0
-    profiles:
-      - suricata
+    command: >
+      -i ens192
+      --set default-rule-path=/etc/suricata/rules
+      --set rule-files.0=suricata.rules
+      --set classification-file=/etc/suricata/classification.config
+      --set reference-config-file=/etc/suricata/reference.config
 
   # ──────────────────────────────────────────────────────
   # OWASP ZAP custom (M5 — DAST + PCAP)

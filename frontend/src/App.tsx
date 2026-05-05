@@ -22,6 +22,7 @@ const Admin       = lazy(() => import("./pages/Admin"));
 const SASTPage    = lazy(() => import("./pages/SASTScanner"));
 const DASTPage    = lazy(() => import("./pages/DASTSandbox"));
 const CICDPage    = lazy(() => import("./pages/CICD"));
+const ScanResultsPage = lazy(() => import("./pages/ScanResults"));
 
 function PageFallback() {
   return (
@@ -70,6 +71,7 @@ export default function App() {
               <Route path="/sast" element={<SASTPage />} />
               <Route path="/dast" element={<DASTPage />} />
               <Route path="/cicd" element={<CICDPage />} />
+              <Route path="/scan-results" element={<ScanResultsPage />} />
             </Routes>
           </Suspense>
         </main>

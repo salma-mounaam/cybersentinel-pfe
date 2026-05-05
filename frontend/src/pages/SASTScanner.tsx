@@ -187,11 +187,7 @@ export default function SASTScanner() {
   }, []);
 
   const handleLaunchScan = () => {
-    navigate("/scan-code", {
-      state: {
-        autoStartSast: true,
-      },
-    });
+    navigate("/scan-code");
   };
 
   const filteredFindings = useMemo(() => {
