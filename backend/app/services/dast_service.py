@@ -29,7 +29,7 @@ COMPOSE_PROJECT_NAME = "cybersentinel"
 
 ALLOWED_TARGETS = {
     "webgoat": "http://cybersentinel_webgoat:8080/WebGoat",
-    "dvwa":    "http://cybersentinel_dvwa:80",
+    "dvwa":    "http://cybersentinel_dvwa:80/login.php",
 }
 TARGET_SERVICES = {"webgoat": "webgoat", "dvwa": "dvwa"}
 

@@ -1,8 +1,6 @@
 // ============================================================
-// pages/CodeScan.tsx — Barre unifiée (fixes cohérence)
-// FIX 1: DAST zip → /scan-results (plus d'affichage inline)
-// FIX 2: autoStartSast → /scan-results
-// FIX 3: tous les cas passent par /scan-results
+// pages/CodeScan.tsx
+// FIX : Repo GitHub + SAST récupère un scan_id via latest-scan
 // ============================================================
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
@@ -30,18 +28,27 @@ type DastTarget = "webgoat" | "dvwa";
 async function uploadAndScanDast(file: File): Promise<any> {
   const formData = new FormData();
   formData.append("file", file);
+
   const apiBase =
     process.env.REACT_APP_API_URL?.replace(/\/$/, "") || "http://localhost:8000/api";
+
   const res = await fetch(`${apiBase}/dast/start/from-upload`, {
     method: "POST",
     body: formData,
   });
+
   let payload: any = null;
-  try { payload = await res.json(); } catch { payload = null; }
+  try {
+    payload = await res.json();
+  } catch {
+    payload = null;
+  }
+
   if (!res.ok) {
     const msg = payload?.detail || payload?.error || `Erreur HTTP ${res.status}`;
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
+
   return payload;
 }
 
@@ -70,97 +77,226 @@ export function CodeScan() {
   const canScan = (): boolean => {
     if (status === "scanning") return false;
     if (!sastOn && !dastOn && !cicdOn) return false;
+
+    if (dastOn && !sastOn && !cicdOn && sourceMode === "path") {
+      return true;
+    }
+
     if (sourceMode === "path") return localPath.trim().length > 2;
     if (sourceMode === "zip") return !!zipFile && zipFile.name.toLowerCase().endsWith(".zip");
     if (sourceMode === "git") return gitUrl.startsWith("https://github.com/");
-    return false;
-  };
 
-  // ── Destination commune ──────────────────────────────────
-  const goToResults = (dastResult?: any) => {
-    navigate("/scan-results", {
-      state: { sastOn, dastOn, cicdOn, projectName, sourceMode, dastTarget, dastResult },
-    });
+    return false;
   };
 
   const handleScan = useCallback(async () => {
     setStatus("scanning");
     setError("");
 
+    const _sastOn = sastOn;
+    const _dastOn = dastOn;
+    const _cicdOn = cicdOn;
+    const _sourceMode = sourceMode;
+    const _zipFile = zipFile;
+    const _localPath = localPath;
+    const _projectName = projectName;
+    const _gitUrl = gitUrl;
+    const _gitBranch = gitBranch;
+    const _dastTarget = dastTarget;
+
+    const goToResults = (dastResult?: any, sastScanId?: string | null) => {
+      console.log("[CodeScan] goToResults → sastScanId:", sastScanId);
+
+      navigate("/scan-results", {
+        state: {
+          sastOn: _sastOn,
+          dastOn: _dastOn,
+          cicdOn: _cicdOn,
+          projectName: _projectName,
+          sourceMode: _sourceMode,
+          dastTarget: _dastTarget,
+          dastResult,
+          sastScanId,
+        },
+      });
+    };
+
     try {
-      // ── SAST ─────────────────────────────────────────────
-      if (sastOn) {
-        if (sourceMode === "zip" && zipFile)
-          await sastAPI.uploadScan(zipFile, projectName || "scan");
-        else if (sourceMode === "git")
-          await cicdAPI.scanRepo(gitUrl, gitBranch);
-        else
-          await sastAPI.scanSync(localPath, projectName || "scan");
-      }
+      let sastScanId: string | null = null;
 
-      // ── CI/CD seul (sans SAST) ───────────────────────────
-      if (cicdOn && !sastOn && sourceMode === "git") {
-        await cicdAPI.scanRepo(gitUrl, gitBranch);
-      }
+      if (_sastOn) {
+        let scanResult: any = null;
 
-      // ── DAST ─────────────────────────────────────────────
-      if (dastOn) {
-        if (sourceMode === "zip" && zipFile) {
-          // FIX 1: zip DAST → /scan-results avec dastResult dans le state
-          const dastRes = await uploadAndScanDast(zipFile);
-          goToResults(dastRes);
+        console.log("[CodeScan] SAST démarré — sourceMode:", _sourceMode);
+
+        if (_sourceMode === "zip" && _zipFile) {
+          scanResult = await sastAPI.uploadScan(_zipFile, _projectName || "scan");
+        } else if (_sourceMode === "git") {
+          const repoName =
+            _projectName ||
+            _gitUrl.split("/").pop()?.replace(".git", "") ||
+            "scan";
+
+          const repoResult = await cicdAPI.scanRepo(_gitUrl, _gitBranch);
+
+          console.log("[CodeScan] Git scan response:", repoResult);
+
+          scanResult =
+            repoResult?.sast_scan ||
+            repoResult?.sast_result ||
+            null;
+
+          if (!scanResult?.scan_id && !scanResult?.scanId && repoResult?.sast_scan_id) {
+            scanResult = {
+              scan_id: repoResult.sast_scan_id,
+            };
+          }
+
+          if (!scanResult?.scan_id && !scanResult?.scanId) {
+            console.log("[CodeScan] attente latest-scan filtré par repo_name:", repoName);
+
+            for (let i = 0; i < 60; i++) {
+              const latest = await sastAPI.getLatestScan({
+                repo_name: repoName,
+              });
+
+              console.log("[CodeScan] latest scan filtré attempt", i, latest);
+
+              if (latest?.scan_id) {
+                scanResult = latest;
+                break;
+              }
+
+              await new Promise((resolve) => setTimeout(resolve, 2000));
+            }
+          }
         } else {
-          const dastRes = await dastAPI.startSync({ target: dastTarget, deploy_target: true });
-          goToResults(dastRes);
+          console.log(
+            "[CodeScan] scanSync → repo_path:",
+            _localPath,
+            "| repo_name:",
+            _projectName || "scan"
+          );
+
+          scanResult = await sastAPI.scanSync(_localPath, _projectName || "scan");
         }
+
+        console.log(
+          "[CodeScan] BACKEND RESPONSE COMPLÈTE:",
+          JSON.stringify(scanResult, null, 2)
+        );
+
+        sastScanId =
+          scanResult?.scan_id ??
+          scanResult?.scanId ??
+          null;
+
+        console.log("[CodeScan] sastScanId final:", sastScanId);
+      }
+
+      if (_cicdOn && !_sastOn && _sourceMode === "git") {
+        await cicdAPI.scanRepo(_gitUrl, _gitBranch);
+      }
+
+      if (_dastOn) {
+        if (_sourceMode === "zip" && _zipFile) {
+          const dastRes = await uploadAndScanDast(_zipFile);
+          goToResults(dastRes, sastScanId);
+        } else {
+          const dastRes = await dastAPI.startSync({
+            target: _dastTarget,
+            deploy_target: true,
+          });
+
+          goToResults(dastRes, sastScanId);
+        }
+
         return;
       }
 
-      // ── Pas de DAST → /scan-results directement ──────────
-      goToResults();
+      goToResults(undefined, sastScanId);
     } catch (e: any) {
+      console.error("[CodeScan] ERREUR scan:", e);
+
       const msg = e?.message || "Erreur lors du scan";
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
       setStatus("error");
     }
-  }, [sastOn, dastOn, cicdOn, sourceMode, zipFile, localPath, projectName, gitUrl, gitBranch, dastTarget]);
+  }, [
+    sastOn,
+    dastOn,
+    cicdOn,
+    sourceMode,
+    zipFile,
+    localPath,
+    projectName,
+    gitUrl,
+    gitBranch,
+    dastTarget,
+    navigate,
+  ]);
 
-  // ── FIX 2: autoStartSast → /scan-results ─────────────────
   useEffect(() => {
     const state = location.state as any;
+
     if (!state?.autoStartSast || autoStartedRef.current) return;
+
     autoStartedRef.current = true;
 
     setSourceMode("path");
     setSastOn(true);
+
     if (state?.projectName) setProjectName(state.projectName);
     if (state?.localPath) setLocalPath(state.localPath);
 
     if (state?.localPath?.trim().length > 2) {
       setStatus("scanning");
-      sastAPI.scanSync(state.localPath, state.projectName || "scan")
-        .then(() => {
-          // FIX 2: vers /scan-results au lieu de /sast
+
+      sastAPI
+        .scanSync(state.localPath, state.projectName || "scan")
+        .then((scanResult: any) => {
+          const sastScanId =
+            scanResult?.scan_id ??
+            scanResult?.scanId ??
+            null;
+
+          console.log("[CodeScan] autoStart → scan_id:", sastScanId);
+
           navigate("/scan-results", {
             state: {
-              sastOn: true, dastOn: false, cicdOn: false,
+              sastOn: true,
+              dastOn: false,
+              cicdOn: false,
               projectName: state.projectName || "",
-              sourceMode: "path", dastTarget: "webgoat",
+              sourceMode: "path",
+              dastTarget: "webgoat",
+              sastScanId,
             },
           });
         })
-        .catch((e: any) => { setError(e?.message || "Erreur"); setStatus("error"); });
+        .catch((e: any) => {
+          setError(e?.message || "Erreur");
+          setStatus("error");
+        });
     }
   }, [location.state, navigate]);
 
-  const activeModules = [sastOn && "SAST", dastOn && "DAST", cicdOn && "CI/CD"].filter(Boolean) as string[];
-  const launchLabel = activeModules.length > 0 ? "Lancer le scan" : "Choisir un module";
+  const activeModules = [
+    sastOn && "SAST",
+    dastOn && "DAST",
+    cicdOn && "CI/CD",
+  ].filter(Boolean) as string[];
+
+  const launchLabel =
+    activeModules.length > 0 ? "Lancer le scan" : "Choisir un module";
 
   const durationHint = [
     sastOn && "Semgrep · Trivy · Gitleaks · 1–5 min",
     dastOn && "OWASP ZAP · sandbox isolée · 10–20 min",
     cicdOn && "Quality Gate · blocage PR critiques",
-  ].filter(Boolean).join("  ·  ");
+  ]
+    .filter(Boolean)
+    .join("  ·  ");
 
   const sourceHints: Record<SourceMode, string> = {
     path: "Ce chemin doit exister côté backend FastAPI",
@@ -169,36 +305,42 @@ export function CodeScan() {
   };
 
   const launchColorClass = canScan()
-    ? dastOn && sastOn  ? "bg-purple-600 hover:bg-purple-700 text-white"
-    : dastOn            ? "bg-red-600 hover:bg-red-700 text-white"
-    : cicdOn && !sastOn ? "bg-teal-600 hover:bg-teal-700 text-white"
-    :                     "bg-blue-600 hover:bg-blue-700 text-white"
+    ? dastOn && sastOn
+      ? "bg-purple-600 hover:bg-purple-700 text-white"
+      : dastOn
+      ? "bg-red-600 hover:bg-red-700 text-white"
+      : cicdOn && !sastOn
+      ? "bg-teal-600 hover:bg-teal-700 text-white"
+      : "bg-blue-600 hover:bg-blue-700 text-white"
     : "bg-card text-muted-foreground cursor-not-allowed";
 
   return (
     <div className="flex flex-col items-center w-full px-8 py-10">
       <div className="w-full max-w-5xl space-y-8">
-
-        {/* Header */}
         <div className="flex items-center gap-3">
-          <button onClick={() => navigate("/")} className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground">
+          <button
+            onClick={() => navigate("/")}
+            className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground"
+          >
             <ArrowLeft size={16} />
           </button>
+
           <div>
             <h1 className="text-2xl font-semibold">Scan Center</h1>
-            <p className="text-sm text-muted-foreground mt-1">Importez votre projet et choisissez les modules à exécuter</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              Importez votre projet et choisissez les modules à exécuter
+            </p>
           </div>
         </div>
 
-        {/* ── Barre unifiée ────────────────────────────────── */}
         <div className="rounded-xl border border-cyber-border bg-card/50 overflow-hidden">
-
           <div className="flex items-stretch h-14 border-b border-cyber-border/60">
-
-            {/* Dropdown source */}
             <select
               value={sourceMode}
-              onChange={(e) => { setSourceMode(e.target.value as SourceMode); setZipFile(null); }}
+              onChange={(e) => {
+                setSourceMode(e.target.value as SourceMode);
+                setZipFile(null);
+              }}
               className="h-full bg-card border-r border-cyber-border/60 px-4 text-sm text-foreground font-mono cursor-pointer outline-none focus:bg-card/80 shrink-0"
               style={{ minWidth: "180px" }}
             >
@@ -207,7 +349,6 @@ export function CodeScan() {
               <option value="git">Repo GitHub</option>
             </select>
 
-            {/* Champ source */}
             <div className="flex-1 flex items-center min-w-0">
               {sourceMode === "path" && (
                 <div className="flex-1 flex items-center gap-3 px-4">
@@ -220,29 +361,55 @@ export function CodeScan() {
                   />
                 </div>
               )}
+
               {sourceMode === "zip" && (
                 <div className="flex-1 flex items-center gap-3 px-4">
-                  <input ref={fileInputRef} type="file" accept=".zip" className="hidden"
-                    onChange={(e) => { const f = e.target.files?.[0]; if (f) setZipFile(f); }} />
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".zip"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) setZipFile(f);
+                    }}
+                  />
+
                   {zipFile ? (
                     <div className="flex items-center gap-2 flex-1 min-w-0">
                       <CheckCircle2 size={15} className="text-green-400 shrink-0" />
-                      <span className="text-sm font-mono text-green-300 truncate">{zipFile.name}</span>
-                      <span className="text-xs text-muted-foreground shrink-0">{(zipFile.size / 1024).toFixed(0)} KB</span>
-                      <button onClick={() => { setZipFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }} className="ml-auto text-muted-foreground hover:text-foreground shrink-0">
+                      <span className="text-sm font-mono text-green-300 truncate">
+                        {zipFile.name}
+                      </span>
+                      <span className="text-xs text-muted-foreground shrink-0">
+                        {(zipFile.size / 1024).toFixed(0)} KB
+                      </span>
+                      <button
+                        onClick={() => {
+                          setZipFile(null);
+                          if (fileInputRef.current) fileInputRef.current.value = "";
+                        }}
+                        className="ml-auto text-muted-foreground hover:text-foreground shrink-0"
+                      >
                         <X size={13} />
                       </button>
                     </div>
                   ) : (
                     <>
-                      <button onClick={() => fileInputRef.current?.click()} className="shrink-0 px-3 py-1.5 rounded border border-cyber-border text-xs text-muted-foreground hover:text-foreground hover:bg-card transition-colors">
+                      <button
+                        onClick={() => fileInputRef.current?.click()}
+                        className="shrink-0 px-3 py-1.5 rounded border border-cyber-border text-xs text-muted-foreground hover:text-foreground hover:bg-card transition-colors"
+                      >
                         Parcourir
                       </button>
-                      <span className="text-sm text-muted-foreground/50 font-mono truncate">Aucun fichier sélectionné</span>
+                      <span className="text-sm text-muted-foreground/50 font-mono truncate">
+                        Aucun fichier sélectionné
+                      </span>
                     </>
                   )}
                 </div>
               )}
+
               {sourceMode === "git" && (
                 <div className="flex-1 flex items-center gap-3 px-4">
                   <GitBranch size={15} className="text-muted-foreground shrink-0" />
@@ -252,9 +419,14 @@ export function CodeScan() {
                     placeholder="https://github.com/org/repo"
                     className="flex-1 bg-transparent text-sm font-mono outline-none placeholder:text-muted-foreground/50"
                   />
+
                   <div className="flex items-center gap-2 shrink-0 border-l border-cyber-border/40 pl-4">
                     <span className="text-xs text-muted-foreground">branche</span>
-                    <input value={gitBranch} onChange={(e) => setGitBranch(e.target.value)} className="w-20 bg-transparent text-sm font-mono outline-none text-foreground" />
+                    <input
+                      value={gitBranch}
+                      onChange={(e) => setGitBranch(e.target.value)}
+                      className="w-20 bg-transparent text-sm font-mono outline-none text-foreground"
+                    />
                   </div>
                 </div>
               )}
@@ -262,61 +434,98 @@ export function CodeScan() {
 
             <div className="w-px bg-cyber-border/60 self-stretch" />
 
-            {/* Toggles modules */}
             <div className="flex items-center gap-2 px-4 shrink-0">
               {[
-                { key: "sast", on: sastOn, set: setSastOn, icon: <Shield size={14} />, label: "SAST", activeClass: "bg-blue-500/15 text-blue-400 border-blue-500/30" },
-                { key: "dast", on: dastOn, set: setDastOn, icon: <Zap size={14} />, label: "DAST", activeClass: "bg-red-500/15 text-red-400 border-red-500/30" },
-                { key: "cicd", on: cicdOn, set: setCicdOn, icon: <Code2 size={14} />, label: "CI/CD", activeClass: "bg-teal-500/15 text-teal-400 border-teal-500/30" },
+                {
+                  key: "sast",
+                  on: sastOn,
+                  set: setSastOn,
+                  icon: <Shield size={14} />,
+                  label: "SAST",
+                  activeClass: "bg-blue-500/15 text-blue-400 border-blue-500/30",
+                },
+                {
+                  key: "dast",
+                  on: dastOn,
+                  set: setDastOn,
+                  icon: <Zap size={14} />,
+                  label: "DAST",
+                  activeClass: "bg-red-500/15 text-red-400 border-red-500/30",
+                },
+                {
+                  key: "cicd",
+                  on: cicdOn,
+                  set: setCicdOn,
+                  icon: <Code2 size={14} />,
+                  label: "CI/CD",
+                  activeClass: "bg-teal-500/15 text-teal-400 border-teal-500/30",
+                },
               ].map(({ key, on, set, icon, label, activeClass }) => (
                 <button
                   key={key}
                   onClick={() => set(!on)}
                   className={cn(
                     "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all border",
-                    on ? activeClass : "text-muted-foreground border-transparent hover:border-cyber-border hover:text-foreground"
+                    on
+                      ? activeClass
+                      : "text-muted-foreground border-transparent hover:border-cyber-border hover:text-foreground"
                   )}
                 >
-                  {icon}{label}
+                  {icon}
+                  {label}
                 </button>
               ))}
             </div>
 
             <div className="w-px bg-cyber-border/60 self-stretch" />
 
-            {/* Bouton launch */}
             <button
               onClick={handleScan}
               disabled={!canScan()}
-              className={cn("flex items-center gap-2 px-7 text-sm font-semibold transition-all shrink-0 h-full whitespace-nowrap", launchColorClass)}
+              className={cn(
+                "flex items-center gap-2 px-7 text-sm font-semibold transition-all shrink-0 h-full whitespace-nowrap",
+                launchColorClass
+              )}
             >
-              {status === "scanning" ? <Loader2 size={15} className="animate-spin" /> : <Play size={15} />}
+              {status === "scanning" ? (
+                <Loader2 size={15} className="animate-spin" />
+              ) : (
+                <Play size={15} />
+              )}
               {status === "scanning" ? "Scan en cours..." : launchLabel}
             </button>
           </div>
 
-          {/* Sous-ligne hints */}
           <div className="px-5 py-3 flex items-center justify-between gap-4">
             <p className="text-xs text-muted-foreground">{sourceHints[sourceMode]}</p>
-            {durationHint && <p className="text-xs text-muted-foreground shrink-0">{durationHint}</p>}
+            {durationHint && (
+              <p className="text-xs text-muted-foreground shrink-0">
+                {durationHint}
+              </p>
+            )}
           </div>
 
-          {/* Options DAST cible */}
           {dastOn && sourceMode !== "zip" && (
             <div className="px-5 pb-4 border-t border-cyber-border/40 pt-4 flex items-center gap-4">
-              <span className="text-sm text-muted-foreground shrink-0">Cible DAST :</span>
+              <span className="text-sm text-muted-foreground shrink-0">
+                Cible DAST :
+              </span>
+
               {(["webgoat", "dvwa"] as DastTarget[]).map((t) => (
                 <button
                   key={t}
                   onClick={() => setDastTarget(t)}
                   className={cn(
                     "px-4 py-1.5 rounded-lg text-sm transition-all border",
-                    dastTarget === t ? "bg-red-500/15 text-red-400 border-red-500/30" : "text-muted-foreground border-cyber-border hover:text-foreground"
+                    dastTarget === t
+                      ? "bg-red-500/15 text-red-400 border-red-500/30"
+                      : "text-muted-foreground border-cyber-border hover:text-foreground"
                   )}
                 >
                   {t === "webgoat" ? "WebGoat" : "DVWA"}
                 </button>
               ))}
+
               <div className="flex items-center gap-2 ml-2 text-xs text-amber-400/80">
                 <AlertTriangle size={12} />
                 Sandbox isolée · contrainte C-05
@@ -324,29 +533,43 @@ export function CodeScan() {
             </div>
           )}
 
-          {/* Drop zone ZIP */}
           {sourceMode === "zip" && !zipFile && (
             <div
               onClick={() => fileInputRef.current?.click()}
-              onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDragging(true);
+              }}
               onDragLeave={() => setIsDragging(false)}
-              onDrop={(e) => { e.preventDefault(); setIsDragging(false); const f = e.dataTransfer.files?.[0]; if (f) setZipFile(f); }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDragging(false);
+                const f = e.dataTransfer.files?.[0];
+                if (f) setZipFile(f);
+              }}
               className={cn(
                 "mx-5 mb-4 cursor-pointer rounded-lg border-2 border-dashed p-8 text-center transition-all",
-                isDragging ? "border-blue-500/60 bg-blue-500/8" : "border-cyber-border/40 hover:border-cyber-border"
+                isDragging
+                  ? "border-blue-500/60 bg-blue-500/8"
+                  : "border-cyber-border/40 hover:border-cyber-border"
               )}
             >
               <Upload size={20} className="mx-auto mb-2 text-muted-foreground/40" />
-              <p className="text-sm text-muted-foreground">Glissez votre projet ZIP ici</p>
-              <p className="text-xs text-muted-foreground/60 mt-1">Spring Boot · Node · Flask/FastAPI · PHP Apache</p>
+              <p className="text-sm text-muted-foreground">
+                Glissez votre projet ZIP ici
+              </p>
+              <p className="text-xs text-muted-foreground/60 mt-1">
+                Spring Boot · Node · Flask/FastAPI · PHP Apache
+              </p>
             </div>
           )}
         </div>
 
-        {/* Nom du projet */}
         {(sastOn || dastOn) && (
           <div className="flex items-center gap-3">
-            <label className="text-sm text-muted-foreground shrink-0">Nom du projet</label>
+            <label className="text-sm text-muted-foreground shrink-0">
+              Nom du projet
+            </label>
             <input
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
@@ -356,60 +579,94 @@ export function CodeScan() {
           </div>
         )}
 
-        {/* Cartes info modules actifs */}
         {activeModules.length > 0 && (
-          <div className={cn(
-            "grid gap-4",
-            activeModules.length === 1 ? "grid-cols-1 max-w-sm" :
-            activeModules.length === 2 ? "grid-cols-2" : "grid-cols-3"
-          )}>
+          <div
+            className={cn(
+              "grid gap-4",
+              activeModules.length === 1
+                ? "grid-cols-1 max-w-sm"
+                : activeModules.length === 2
+                ? "grid-cols-2"
+                : "grid-cols-3"
+            )}
+          >
             {sastOn && (
               <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 p-5">
                 <div className="flex items-center gap-2 mb-3">
                   <Shield size={15} className="text-blue-400" />
-                  <span className="text-sm font-medium text-blue-400">Scan statique</span>
-                  <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/20">M4</span>
+                  <span className="text-sm font-medium text-blue-400">
+                    Scan statique
+                  </span>
+                  <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/20">
+                    M4
+                  </span>
                 </div>
-                <p className="text-xs text-muted-foreground">Semgrep · Trivy · Gitleaks</p>
-                <p className="text-xs text-muted-foreground mt-1">SARIF · MITRE ATT&CK mapping</p>
+                <p className="text-xs text-muted-foreground">
+                  Semgrep · Trivy · Gitleaks
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  SARIF · MITRE ATT&CK mapping
+                </p>
               </div>
             )}
+
             {dastOn && (
               <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-5">
                 <div className="flex items-center gap-2 mb-3">
                   <Zap size={15} className="text-red-400" />
-                  <span className="text-sm font-medium text-red-400">Scan dynamique</span>
-                  <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/20">M5</span>
+                  <span className="text-sm font-medium text-red-400">
+                    Scan dynamique
+                  </span>
+                  <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/20">
+                    M5
+                  </span>
                 </div>
-                <p className="text-xs text-muted-foreground">OWASP ZAP · 6 phases</p>
-                <p className="text-xs text-muted-foreground mt-1">Proof-of-exploit · PCAP labelisé</p>
+                <p className="text-xs text-muted-foreground">
+                  OWASP ZAP · 6 phases
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Proof-of-exploit · PCAP labelisé
+                </p>
               </div>
             )}
+
             {cicdOn && (
               <div className="rounded-xl border border-teal-500/20 bg-teal-500/5 p-5">
                 <div className="flex items-center gap-2 mb-3">
                   <Code2 size={15} className="text-teal-400" />
-                  <span className="text-sm font-medium text-teal-400">Pipeline CI/CD</span>
-                  <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-teal-500/15 text-teal-400 border border-teal-500/20">M8</span>
+                  <span className="text-sm font-medium text-teal-400">
+                    Pipeline CI/CD
+                  </span>
+                  <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-teal-500/15 text-teal-400 border border-teal-500/20">
+                    M8
+                  </span>
                 </div>
-                <p className="text-xs text-muted-foreground">GitHub Actions · Quality Gate</p>
-                <p className="text-xs text-muted-foreground mt-1">Blocage automatique PR critiques</p>
+                <p className="text-xs text-muted-foreground">
+                  GitHub Actions · Quality Gate
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Blocage automatique PR critiques
+                </p>
               </div>
             )}
           </div>
         )}
 
-        {/* Erreur */}
         {status === "error" && error && (
           <div className="flex items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/8 p-4 text-red-300">
             <AlertTriangle size={16} className="shrink-0" />
             <p className="text-sm">{error}</p>
-            <button onClick={() => { setError(""); setStatus("idle"); }} className="ml-auto text-red-300/60 hover:text-red-300">
+            <button
+              onClick={() => {
+                setError("");
+                setStatus("idle");
+              }}
+              className="ml-auto text-red-300/60 hover:text-red-300"
+            >
               <X size={14} />
             </button>
           </div>
         )}
-
       </div>
     </div>
   );

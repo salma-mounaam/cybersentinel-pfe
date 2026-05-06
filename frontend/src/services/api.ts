@@ -128,14 +128,19 @@ export const sastAPI = {
     return postForm<any>("/sast/scan/upload", formData);
   },
 
-  getLatestScan: (repo_name?: string) => {
+  getLatestScan: (params?: { repo_name?: string; commit_sha?: string }) => {
     const q = new URLSearchParams();
-    if (repo_name) q.set("repo_name", repo_name);
+
+    if (params?.repo_name) q.set("repo_name", params.repo_name);
+    if (params?.commit_sha) q.set("commit_sha", params.commit_sha);
+
     const qs = q.toString();
 
-    return get<{ scan_id: string | null }>(
-      `/sast/latest-scan${qs ? `?${qs}` : ""}`
-    );
+    return get<{
+      scan_id: string | null;
+      repo_name?: string;
+      commit_sha?: string;
+    }>(`/sast/latest-scan${qs ? `?${qs}` : ""}`);
   },
 
   getFindings: (params?: {

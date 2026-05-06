@@ -4,8 +4,10 @@
 # - scan par chemin local
 # - scan synchrone
 # - upload ZIP projet
+# DEBUG : logs ajoutés sur /scan/sync pour tracer scan_id
 # ============================================================
 
+import logging
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -29,6 +31,7 @@ from app.services.sast_service import SASTOrchestrator
 
 router = APIRouter()
 orchestrator = SASTOrchestrator()
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -76,12 +79,31 @@ async def trigger_scan_sync(payload: dict):
     Lance un scan SAST synchrone.
     Pour les tests et la démo live.
     """
+    repo_path = payload.get("repo_path", ".")
+    repo_name = payload.get("repo_name", "")
+
+    # DEBUG — trace ce que le frontend envoie
+    logger.info(
+        f"[SAST /scan/sync] reçu → "
+        f"repo_path={repo_path!r} | "
+        f"repo_name={repo_name!r}"
+    )
+
     result = await orchestrator.run_full_scan(
-        repo_path=payload.get("repo_path", "."),
-        repo_name=payload.get("repo_name", ""),
+        repo_path=repo_path,
+        repo_name=repo_name,
         commit_sha=payload.get("commit_sha", ""),
         pr_number=payload.get("pr_number"),
     )
+
+    # DEBUG — trace ce que le backend retourne
+    logger.info(
+        f"[SAST /scan/sync] terminé → "
+        f"scan_id={result.get('scan_id')!r} | "
+        f"total={result.get('total')} | "
+        f"error={result.get('error')!r}"
+    )
+
     return result
 
 
@@ -120,11 +142,25 @@ async def trigger_scan_upload(
 
     repo_name = project_name.strip() or Path(filename).stem
 
+    logger.info(
+        f"[SAST /scan/upload] reçu → "
+        f"filename={filename!r} | "
+        f"repo_name={repo_name!r}"
+    )
+
     result = await orchestrator.run_uploaded_scan(
         zip_path=tmp_path,
         repo_name=repo_name,
         commit_sha=commit_sha.strip(),
     )
+
+    logger.info(
+        f"[SAST /scan/upload] terminé → "
+        f"scan_id={result.get('scan_id')!r} | "
+        f"total={result.get('total')} | "
+        f"error={result.get('error')!r}"
+    )
+
     return result
 
 
@@ -179,6 +215,9 @@ async def get_sast_stats(
     """
     KPIs SAST pour la page Overview.
     """
+    # DEBUG — trace le scan_id reçu par /stats
+    logger.info(f"[SAST /stats] scan_id reçu = {scan_id!r}")
+
     base_query = select(SASTFinding)
 
     if scan_id:
@@ -210,6 +249,8 @@ async def get_sast_stats(
 
     confirmed_by_dast = await db.scalar(q)
 
+    logger.info(f"[SAST /stats] résultat → total={total} | scan_id_filtre={scan_id!r}")
+
     return {
         "scan_id": scan_id,
         "total": total or 0,
@@ -227,14 +268,21 @@ async def get_sast_stats(
 @router.get("/latest-scan")
 async def get_latest_scan(
     repo_name: Optional[str] = None,
+    commit_sha: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(SASTFinding.scan_id, SASTFinding.created_at).where(
-        SASTFinding.scan_id.is_not(None)
-    )
+    query = select(
+        SASTFinding.scan_id,
+        SASTFinding.created_at,
+        SASTFinding.repo_name,
+        SASTFinding.commit_sha,
+    ).where(SASTFinding.scan_id.is_not(None))
 
     if repo_name:
         query = query.where(SASTFinding.repo_name == repo_name)
+
+    if commit_sha:
+        query = query.where(SASTFinding.commit_sha == commit_sha)
 
     query = query.order_by(desc(SASTFinding.created_at))
 
@@ -242,9 +290,17 @@ async def get_latest_scan(
     row = result.first()
 
     if not row:
-        return {"scan_id": None}
+        return {
+            "scan_id": None,
+            "repo_name": repo_name,
+            "commit_sha": commit_sha,
+        }
 
-    return {"scan_id": row[0]}
+    return {
+        "scan_id": row[0],
+        "repo_name": row[2],
+        "commit_sha": row[3],
+    }
 
 
 # ============================================================
@@ -255,9 +311,6 @@ async def get_finding(
     finding_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Détail d'un finding SAST.
-    """
     result = await db.execute(
         select(SASTFinding).where(SASTFinding.id == finding_id)
     )
@@ -274,16 +327,6 @@ async def get_finding(
 # ============================================================
 @router.post("/quality-gate")
 async def evaluate_quality_gate(payload: dict):
-    """
-    Évalue le quality gate M8 sur les résultats SAST.
-    Body:
-    {
-      "critical_count": 1,
-      "high_count": 3,
-      "secrets_found": false,
-      "ml_smoke_pass": true
-    }
-    """
     critical_count = payload.get("critical_count", 0)
     high_count = payload.get("high_count", 0)
     secrets_found = payload.get("secrets_found", False)

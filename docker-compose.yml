@@ -3,14 +3,10 @@
 # 3 réseaux Docker imposés par le CDC :
 #   main-net    : services principaux
 #   mgmt-net    : canal backend ↔ ZAP
-#   sandbox-net : cibles DAST (internal:true — ZERO internet)
-# FIX : command Suricata — pointe vers /etc/suricata/rules (volume monté)
+#   sandbox-net : cibles DAST internal:true — ZERO internet
 # ============================================================
 
 services:
-  # ──────────────────────────────────────────────────────
-  # BASE DE DONNÉES
-  # ──────────────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
     container_name: cybersentinel_postgres
@@ -32,9 +28,6 @@ services:
     ports:
       - "5432:5432"
 
-  # ──────────────────────────────────────────────────────
-  # CACHE & BROKER
-  # ──────────────────────────────────────────────────────
   redis:
     image: redis:7.2-alpine
     container_name: cybersentinel_redis
@@ -53,9 +46,6 @@ services:
     ports:
       - "6379:6379"
 
-  # ──────────────────────────────────────────────────────
-  # BACKEND FASTAPI
-  # ──────────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
@@ -100,9 +90,6 @@ services:
       --reload
       --reload-dir /app/app
 
-  # ──────────────────────────────────────────────────────
-  # WORKER CELERY
-  # ──────────────────────────────────────────────────────
   celery_worker:
     build:
       context: ./backend
@@ -132,9 +119,6 @@ services:
     healthcheck:
       disable: true
 
-  # ──────────────────────────────────────────────────────
-  # CELERY BEAT
-  # ──────────────────────────────────────────────────────
   celery_beat:
     build:
       context: ./backend
@@ -161,9 +145,6 @@ services:
     healthcheck:
       disable: true
 
-  # ──────────────────────────────────────────────────────
-  # FRONTEND REACT
-  # ──────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
@@ -182,12 +163,6 @@ services:
       REACT_APP_API_ROOT: http://localhost:8000
       REACT_APP_WS_URL: ws://localhost:8000/ws
 
-  # ──────────────────────────────────────────────────────
-  # SURICATA IDS (M1)
-  # FIX : command pointe vers /etc/suricata/rules (volume monté)
-  # Avant : règles cherchées dans /var/lib/suricata/rules (non persistant)
-  # Après : règles lues depuis ./suricata/rules monté en volume
-  # ──────────────────────────────────────────────────────
   suricata:
     image: jasonish/suricata:latest
     container_name: cybersentinel_suricata
@@ -208,9 +183,6 @@ services:
       --set classification-file=/etc/suricata/classification.config
       --set reference-config-file=/etc/suricata/reference.config
 
-  # ──────────────────────────────────────────────────────
-  # OWASP ZAP custom (M5 — DAST + PCAP)
-  # ──────────────────────────────────────────────────────
   zap:
     image: cybersentinel-zap:custom
     container_name: cybersentinel_zap
@@ -281,7 +253,8 @@ networks:
 
   sandbox-net:
     name: cybersentinel_sandbox-net
-    external: true
+    driver: bridge
+    internal: true
 
 volumes:
   postgres_data:
