@@ -15,6 +15,7 @@ class AlertSource(str, enum.Enum):
     M1_SURICATA = "M1_suricata"
     M2_ML       = "M2_ml"
     M3_FUSION   = "M3_fusion"
+    M11_WAZUH = "M11_wazuh"
 
 
 class Alert(Base):

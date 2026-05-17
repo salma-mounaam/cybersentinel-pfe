@@ -522,3 +522,16 @@ export const healthAPI = {
     return res.json();
   },
 };
+// ============================================================
+// M11 — HIDS / Wazuh API
+// ============================================================
+
+export const hidsAPI = {
+  getStats: () => get<any>("/hids/stats"),
+
+  getAlerts: (limit = 50) =>
+    get<any>(`/hids/alerts?limit=${limit}`),
+
+  getAgentStatus: (name = "ai-learn") =>
+    get<any>(`/hids/agent/status?name=${encodeURIComponent(name)}`),
+};

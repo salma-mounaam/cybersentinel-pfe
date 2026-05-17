@@ -108,6 +108,8 @@ services:
       # Docker socket pour lancer ZAP / cibles DAST
       - /var/run/docker.sock:/var/run/docker.sock
 
+      - wazuh_logs:/var/ossec/logs:ro
+
     networks:
       - main-net
       - mgmt-net
@@ -360,12 +362,13 @@ services:
       - dast
 
   wazuh-manager:
-    image: wazuh/wazuh-manager:4.7.0
+    image: wazuh/wazuh-manager:4.14.5
     container_name: cybersentinel_wazuh
     restart: unless-stopped
 
     ports:
       - "1514:1514/udp"
+      - "1514:1514/tcp"
       - "1515:1515/tcp"
       - "55000:55000/tcp"
 

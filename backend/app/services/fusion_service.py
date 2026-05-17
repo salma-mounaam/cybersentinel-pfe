@@ -2,6 +2,7 @@
 # M3 — Moteur de Fusion Hybride
 # Confidence = 0.40*S + 0.30*M + 0.30*C
 # Fenêtre temporelle 5 secondes par hôte source
+# Corrélation M11 — HIDS/Wazuh sur fenêtre ±60 secondes
 # ============================================================
 
 import json
@@ -11,6 +12,7 @@ from typing import Optional, Dict
 from collections import defaultdict
 
 import redis.asyncio as aioredis
+from sqlalchemy import select, func, or_
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -25,6 +27,7 @@ W_M = 0.30
 W_C = 0.30
 
 TEMPORAL_WINDOW = 5
+HIDS_CORRELATION_WINDOW = 60
 
 CONFIDENCE_LEVELS = [
     (0.90, SeverityLevel.CRITIQUE),
@@ -58,6 +61,73 @@ class FusionEngine:
             )
             logger.info("PIPELINE_TRACE | REDIS | connexion Redis initialisée")
         return self.redis
+
+    # ========================================================
+    # M11 — Corrélation HIDS / Wazuh
+    # ========================================================
+    async def _check_hids_correlation(
+        self,
+        asset_ip: str,
+        timestamp: datetime,
+    ) -> bool:
+        """
+        Vérifie si Wazuh a émis une alerte sur le même asset
+        dans une fenêtre de ±60 secondes autour du timestamp.
+
+        Version corrigée :
+        - n'utilise pas Alert.asset_ip
+        - n'utilise pas Alert.timestamp
+        - utilise uniquement les colonnes existantes :
+          src_ip, dest_ip, detected_at, created_at
+        """
+        if not asset_ip:
+            return False
+
+        try:
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+            window = timedelta(seconds=HIDS_CORRELATION_WINDOW)
+            start_time = timestamp - window
+            end_time = timestamp + window
+
+            async with AsyncSessionLocal() as db:
+                result = await db.scalar(
+                    select(func.count(Alert.id))
+                    .where(Alert.source == AlertSource.M11_WAZUH)
+                    .where(
+                        or_(
+                            Alert.src_ip == asset_ip,
+                            Alert.dest_ip == asset_ip,
+                        )
+                    )
+                    .where(
+                        or_(
+                            Alert.detected_at.between(start_time, end_time),
+                            Alert.created_at.between(start_time, end_time),
+                        )
+                    )
+                )
+
+            confirmed = (result or 0) > 0
+
+            logger.info(
+                "M3 Fusion | Corrélation HIDS | asset_ip=%s window=%ss confirmed=%s count=%s",
+                asset_ip,
+                HIDS_CORRELATION_WINDOW,
+                confirmed,
+                result or 0,
+            )
+
+            return confirmed
+
+        except Exception as exc:
+            logger.warning(
+                "M3 Fusion | Erreur corrélation HIDS | asset_ip=%s error=%s",
+                asset_ip,
+                exc,
+            )
+            return False
 
     async def process_suricata_alert(self, alert: Alert, raw_event: dict) -> Alert:
         try:
@@ -261,6 +331,9 @@ class FusionEngine:
             return 0.0
 
         now = timestamp
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
         window_start = now - timedelta(seconds=TEMPORAL_WINDOW)
 
         self._temporal_window[src_ip] = [
@@ -291,8 +364,6 @@ class FusionEngine:
     async def _update_alert(self, alert: Alert):
         try:
             async with AsyncSessionLocal() as session:
-                from sqlalchemy import select
-
                 result = await session.execute(
                     select(Alert).where(Alert.id == alert.id)
                 )
@@ -317,7 +388,6 @@ class FusionEngine:
                 db_alert.ocsvm_score = alert.ocsvm_score
                 db_alert.ae_score = alert.ae_score
                 db_alert.suricata_score = alert.suricata_score
-
                 db_alert.attack_type = alert.attack_type
 
                 await session.commit()
@@ -379,6 +449,25 @@ class FusionEngine:
         try:
             r = await self._get_redis()
 
+            alert_time = (
+                getattr(alert, "detected_at", None)
+                or datetime.now(timezone.utc)
+            )
+
+            if alert_time.tzinfo is None:
+                alert_time = alert_time.replace(tzinfo=timezone.utc)
+
+            asset_ip = (
+                getattr(alert, "dest_ip", None)
+                or getattr(alert, "src_ip", None)
+                or ""
+            )
+
+            hids_confirmed = await self._check_hids_correlation(
+                asset_ip=asset_ip,
+                timestamp=alert_time,
+            )
+
             payload = json.dumps(
                 {
                     "alert_id": alert.id,
@@ -388,9 +477,16 @@ class FusionEngine:
                     "technique_name": alert.technique_name,
                     "tactic": alert.tactic,
                     "src_ip": alert.src_ip,
-                    "asset_ip": alert.dest_ip,
+                    "dest_ip": alert.dest_ip,
+                    "asset_ip": asset_ip,
                     "signature_name": alert.signature_name,
                     "attack_type": alert.attack_type or "Unknown",
+
+                    # M11 — Corrélation HIDS/Wazuh
+                    "hids_confirmed": hids_confirmed,
+
+                    # Réutilisé dans le score R comme facteur E élevé
+                    "dast_confirmed": hids_confirmed,
                 },
                 default=str,
             )
@@ -401,7 +497,8 @@ class FusionEngine:
                 f"M3 Fusion | Incident request publié | "
                 f"Alert #{alert.id} | severity={alert.severity.value} | "
                 f"attack_type={alert.attack_type or 'Unknown'} | "
-                f"{alert.src_ip} → {alert.dest_ip}"
+                f"{alert.src_ip} → {alert.dest_ip} | "
+                f"hids_confirmed={hids_confirmed}"
             )
 
         except Exception:
