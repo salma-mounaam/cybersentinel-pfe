@@ -1,11 +1,11 @@
 // ============================================================
 // pages/CodeScan.tsx
-// FIX : Repo GitHub + SAST récupère un scan_id via latest-scan
+// Sources : ZIP upload + Repo GitHub + Image Docker
+// FIX : status reset propre, setStatus("idle") dans finally
 // ============================================================
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import {
-  FolderOpen,
   GitBranch,
   Shield,
   Zap,
@@ -17,13 +17,14 @@ import {
   Upload,
   CheckCircle2,
   X,
+  Container,
+  BrainCircuit,
 } from "lucide-react";
 import { cn } from "../lib/utils";
 import { sastAPI, dastAPI, cicdAPI } from "../services/api";
 
-type SourceMode = "path" | "zip" | "git";
+type SourceMode = "zip" | "git" | "image";
 type ScanStatus = "idle" | "scanning" | "error";
-type DastTarget = "webgoat" | "dvwa";
 
 async function uploadAndScanDast(file: File): Promise<any> {
   const formData = new FormData();
@@ -55,36 +56,34 @@ async function uploadAndScanDast(file: File): Promise<any> {
 export function CodeScan() {
   const navigate = useNavigate();
   const location = useLocation();
-  const autoStartedRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [sourceMode, setSourceMode] = useState<SourceMode>("path");
-  const [localPath, setLocalPath] = useState("");
+  const [sourceMode, setSourceMode] = useState<SourceMode>("zip");
   const [projectName, setProjectName] = useState("");
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [gitUrl, setGitUrl] = useState("");
   const [gitBranch, setGitBranch] = useState("main");
   const [isDragging, setIsDragging] = useState(false);
 
+  // ── Mode Image Docker ──────────────────────────────────────
+  const [dockerImage,      setDockerImage]      = useState("");
+  const [dockerPort,       setDockerPort]       = useState("3000");
+  const [dockerHealthPath, setDockerHealthPath] = useState("/");
+
   const [sastOn, setSastOn] = useState(true);
   const [dastOn, setDastOn] = useState(false);
   const [cicdOn, setCicdOn] = useState(false);
-  const [dastTarget, setDastTarget] = useState<DastTarget>("webgoat");
 
   const [status, setStatus] = useState<ScanStatus>("idle");
-  const [error, setError] = useState("");
+  const [error, setError]   = useState("");
 
   const canScan = (): boolean => {
     if (status === "scanning") return false;
     if (!sastOn && !dastOn && !cicdOn) return false;
 
-    if (dastOn && !sastOn && !cicdOn && sourceMode === "path") {
-      return true;
-    }
-
-    if (sourceMode === "path") return localPath.trim().length > 2;
-    if (sourceMode === "zip") return !!zipFile && zipFile.name.toLowerCase().endsWith(".zip");
-    if (sourceMode === "git") return gitUrl.startsWith("https://github.com/");
+    if (sourceMode === "zip")   return !!zipFile && zipFile.name.toLowerCase().endsWith(".zip");
+    if (sourceMode === "git")   return gitUrl.startsWith("https://github.com/");
+    if (sourceMode === "image") return dockerImage.trim().length > 0;
 
     return false;
   };
@@ -93,28 +92,26 @@ export function CodeScan() {
     setStatus("scanning");
     setError("");
 
-    const _sastOn = sastOn;
-    const _dastOn = dastOn;
-    const _cicdOn = cicdOn;
-    const _sourceMode = sourceMode;
-    const _zipFile = zipFile;
-    const _localPath = localPath;
-    const _projectName = projectName;
-    const _gitUrl = gitUrl;
-    const _gitBranch = gitBranch;
-    const _dastTarget = dastTarget;
+    const _sastOn           = sastOn;
+    const _dastOn           = dastOn;
+    const _cicdOn           = cicdOn;
+    const _sourceMode       = sourceMode;
+    const _zipFile          = zipFile;
+    const _projectName      = projectName;
+    const _gitUrl           = gitUrl;
+    const _gitBranch        = gitBranch;
+    const _dockerImage      = dockerImage.trim();
+    const _dockerPort       = parseInt(dockerPort) || 3000;
+    const _dockerHealthPath = dockerHealthPath || "/";
 
     const goToResults = (dastResult?: any, sastScanId?: string | null) => {
-      console.log("[CodeScan] goToResults → sastScanId:", sastScanId);
-
       navigate("/scan-results", {
         state: {
-          sastOn: _sastOn,
-          dastOn: _dastOn,
-          cicdOn: _cicdOn,
-          projectName: _projectName,
-          sourceMode: _sourceMode,
-          dastTarget: _dastTarget,
+          sastOn:      _sastOn,
+          dastOn:      _dastOn,
+          cicdOn:      _cicdOn,
+          projectName: _projectName || _dockerImage,
+          sourceMode:  _sourceMode,
           dastResult,
           sastScanId,
         },
@@ -124,10 +121,9 @@ export function CodeScan() {
     try {
       let sastScanId: string | null = null;
 
-      if (_sastOn) {
+      // ── SAST : ZIP ou Git uniquement ──────────────────────
+      if (_sastOn && _sourceMode !== "image") {
         let scanResult: any = null;
-
-        console.log("[CodeScan] SAST démarré — sourceMode:", _sourceMode);
 
         if (_sourceMode === "zip" && _zipFile) {
           scanResult = await sastAPI.uploadScan(_zipFile, _projectName || "scan");
@@ -139,147 +135,91 @@ export function CodeScan() {
 
           const repoResult = await cicdAPI.scanRepo(_gitUrl, _gitBranch);
 
-          console.log("[CodeScan] Git scan response:", repoResult);
-
           scanResult =
             repoResult?.sast_scan ||
             repoResult?.sast_result ||
             null;
 
           if (!scanResult?.scan_id && !scanResult?.scanId && repoResult?.sast_scan_id) {
-            scanResult = {
-              scan_id: repoResult.sast_scan_id,
-            };
+            scanResult = { scan_id: repoResult.sast_scan_id };
           }
 
           if (!scanResult?.scan_id && !scanResult?.scanId) {
-            console.log("[CodeScan] attente latest-scan filtré par repo_name:", repoName);
-
             for (let i = 0; i < 60; i++) {
-              const latest = await sastAPI.getLatestScan({
-                repo_name: repoName,
-              });
-
-              console.log("[CodeScan] latest scan filtré attempt", i, latest);
-
-              if (latest?.scan_id) {
-                scanResult = latest;
-                break;
-              }
-
+              const latest = await sastAPI.getLatestScan({ repo_name: repoName });
+              if (latest?.scan_id) { scanResult = latest; break; }
               await new Promise((resolve) => setTimeout(resolve, 2000));
             }
           }
-        } else {
-          console.log(
-            "[CodeScan] scanSync → repo_path:",
-            _localPath,
-            "| repo_name:",
-            _projectName || "scan"
-          );
-
-          scanResult = await sastAPI.scanSync(_localPath, _projectName || "scan");
         }
 
-        console.log(
-          "[CodeScan] BACKEND RESPONSE COMPLÈTE:",
-          JSON.stringify(scanResult, null, 2)
-        );
-
-        sastScanId =
-          scanResult?.scan_id ??
-          scanResult?.scanId ??
-          null;
-
-        console.log("[CodeScan] sastScanId final:", sastScanId);
+        sastScanId = scanResult?.scan_id ?? scanResult?.scanId ?? null;
       }
 
       if (_cicdOn && !_sastOn && _sourceMode === "git") {
         await cicdAPI.scanRepo(_gitUrl, _gitBranch);
       }
 
+      // ── DAST ──────────────────────────────────────────────
       if (_dastOn) {
-        if (_sourceMode === "zip" && _zipFile) {
-          const dastRes = await uploadAndScanDast(_zipFile);
-          goToResults(dastRes, sastScanId);
-        } else {
-          const dastRes = await dastAPI.startSync({
-            target: _dastTarget,
-            deploy_target: true,
-          });
+        let dastRes: any = null;
 
-          goToResults(dastRes, sastScanId);
+        if (_sourceMode === "image") {
+          dastRes = await dastAPI.startFromImage({
+            image:            _dockerImage,
+            port:             _dockerPort,
+            healthcheck_path: _dockerHealthPath,
+            scan_profile:     "baseline",
+          });
+        } else if (_sourceMode === "zip" && _zipFile) {
+          dastRes = await uploadAndScanDast(_zipFile);
+        } else if (_sourceMode === "git") {
+          const repoName =
+            _gitUrl.split("/").pop()?.replace(".git", "") || "target";
+
+          dastRes = await dastAPI.startFromGit({
+            repo_url:     _gitUrl.trim(),
+            branch:       _gitBranch || "main",
+            project_name: _projectName || repoName,
+          });
+        } else {
+          throw new Error("Mode DAST non supporté");
         }
 
+        goToResults(dastRes, sastScanId);
         return;
       }
 
       goToResults(undefined, sastScanId);
     } catch (e: any) {
       console.error("[CodeScan] ERREUR scan:", e);
-
       const msg = e?.message || "Erreur lors du scan";
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
       setStatus("error");
     }
+    // NOTE : pas de finally setStatus("idle") car navigate() démonte le composant.
+    // Le status "scanning" est réinitialisé par le catch en cas d'erreur.
   }, [
-    sastOn,
-    dastOn,
-    cicdOn,
-    sourceMode,
-    zipFile,
-    localPath,
-    projectName,
-    gitUrl,
-    gitBranch,
-    dastTarget,
+    sastOn, dastOn, cicdOn,
+    sourceMode, zipFile, projectName,
+    gitUrl, gitBranch,
+    dockerImage, dockerPort, dockerHealthPath,
     navigate,
   ]);
 
   useEffect(() => {
     const state = location.state as any;
+    if (!state?.autoStartSast) return;
+    console.warn("[CodeScan] autoStartSast ignoré : mode 'path' supprimé");
+  }, [location.state]);
 
-    if (!state?.autoStartSast || autoStartedRef.current) return;
-
-    autoStartedRef.current = true;
-
-    setSourceMode("path");
-    setSastOn(true);
-
-    if (state?.projectName) setProjectName(state.projectName);
-    if (state?.localPath) setLocalPath(state.localPath);
-
-    if (state?.localPath?.trim().length > 2) {
-      setStatus("scanning");
-
-      sastAPI
-        .scanSync(state.localPath, state.projectName || "scan")
-        .then((scanResult: any) => {
-          const sastScanId =
-            scanResult?.scan_id ??
-            scanResult?.scanId ??
-            null;
-
-          console.log("[CodeScan] autoStart → scan_id:", sastScanId);
-
-          navigate("/scan-results", {
-            state: {
-              sastOn: true,
-              dastOn: false,
-              cicdOn: false,
-              projectName: state.projectName || "",
-              sourceMode: "path",
-              dastTarget: "webgoat",
-              sastScanId,
-            },
-          });
-        })
-        .catch((e: any) => {
-          setError(e?.message || "Erreur");
-          setStatus("error");
-        });
+  // Reset status si on change de mode pendant un scan en erreur
+  useEffect(() => {
+    if (status === "error") {
+      setStatus("idle");
+      setError("");
     }
-  }, [location.state, navigate]);
+  }, [sourceMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeModules = [
     sastOn && "SAST",
@@ -291,21 +231,24 @@ export function CodeScan() {
     activeModules.length > 0 ? "Lancer le scan" : "Choisir un module";
 
   const durationHint = [
-    sastOn && "Semgrep · Trivy · Gitleaks · 1–5 min",
-    dastOn && "OWASP ZAP · sandbox isolée · 10–20 min",
+    sastOn && sourceMode !== "image" && "Semgrep · Trivy · Gitleaks · 1–5 min",
+    dastOn && sourceMode === "image" && "Trivy image + OWASP ZAP · 10–20 min",
+    dastOn && sourceMode !== "image" && "OWASP ZAP · sandbox isolée · 10–20 min",
     cicdOn && "Quality Gate · blocage PR critiques",
   ]
     .filter(Boolean)
     .join("  ·  ");
 
   const sourceHints: Record<SourceMode, string> = {
-    path: "Ce chemin doit exister côté backend FastAPI",
-    zip: "ZIP uniquement · Spring Boot, Node, Flask, PHP supportés",
-    git: "Le repo sera cloné et analysé par le backend",
+    zip:   "ZIP uniquement · Spring Boot, Node, Flask, PHP supportés",
+    git:   "Le repo sera cloné et analysé par le backend",
+    image: "Image Docker pré-buildée · Trivy scan + OWASP ZAP · sandbox isolée",
   };
 
   const launchColorClass = canScan()
-    ? dastOn && sastOn
+    ? sourceMode === "image"
+      ? "bg-violet-600 hover:bg-violet-700 text-white"
+      : dastOn && sastOn
       ? "bg-purple-600 hover:bg-purple-700 text-white"
       : dastOn
       ? "bg-red-600 hover:bg-red-700 text-white"
@@ -328,13 +271,15 @@ export function CodeScan() {
           <div>
             <h1 className="text-2xl font-semibold">Scan Center</h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Importez votre projet et choisissez les modules à exécuter
+              Importez votre projet, lancez SAST/DAST, puis expliquez les vulnérabilités avec LLM
             </p>
           </div>
         </div>
 
         <div className="rounded-xl border border-cyber-border bg-card/50 overflow-hidden">
           <div className="flex items-stretch h-14 border-b border-cyber-border/60">
+
+            {/* Sélecteur source */}
             <select
               value={sourceMode}
               onChange={(e) => {
@@ -344,24 +289,15 @@ export function CodeScan() {
               className="h-full bg-card border-r border-cyber-border/60 px-4 text-sm text-foreground font-mono cursor-pointer outline-none focus:bg-card/80 shrink-0"
               style={{ minWidth: "180px" }}
             >
-              <option value="path">Chemin serveur</option>
               <option value="zip">Upload ZIP</option>
               <option value="git">Repo GitHub</option>
+              <option value="image">🐳 Image Docker</option>
             </select>
 
+            {/* Zone saisie selon mode */}
             <div className="flex-1 flex items-center min-w-0">
-              {sourceMode === "path" && (
-                <div className="flex-1 flex items-center gap-3 px-4">
-                  <FolderOpen size={15} className="text-muted-foreground shrink-0" />
-                  <input
-                    value={localPath}
-                    onChange={(e) => setLocalPath(e.target.value)}
-                    placeholder="/app/project"
-                    className="flex-1 bg-transparent text-sm font-mono outline-none placeholder:text-muted-foreground/50"
-                  />
-                </div>
-              )}
 
+              {/* Mode ZIP */}
               {sourceMode === "zip" && (
                 <div className="flex-1 flex items-center gap-3 px-4">
                   <input
@@ -410,6 +346,7 @@ export function CodeScan() {
                 </div>
               )}
 
+              {/* Mode Git */}
               {sourceMode === "git" && (
                 <div className="flex-1 flex items-center gap-3 px-4">
                   <GitBranch size={15} className="text-muted-foreground shrink-0" />
@@ -430,43 +367,82 @@ export function CodeScan() {
                   </div>
                 </div>
               )}
+
+              {/* Mode Image Docker */}
+              {sourceMode === "image" && (
+                <div className="flex-1 flex items-center gap-3 px-4">
+                  <Container size={15} className="text-violet-400 shrink-0" />
+                  <input
+                    value={dockerImage}
+                    onChange={(e) => setDockerImage(e.target.value)}
+                    placeholder="cybersentinel-juiceshop:scan"
+                    className="flex-1 bg-transparent text-sm font-mono outline-none placeholder:text-muted-foreground/50 text-violet-300"
+                  />
+
+                  <div className="flex items-center gap-2 shrink-0 border-l border-cyber-border/40 pl-4">
+                    <span className="text-xs text-muted-foreground">port</span>
+                    <input
+                      value={dockerPort}
+                      onChange={(e) => setDockerPort(e.target.value)}
+                      type="number"
+                      className="w-16 bg-transparent text-sm font-mono outline-none text-foreground"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 border-l border-cyber-border/40 pl-4">
+                    <span className="text-xs text-muted-foreground">healthcheck</span>
+                    <input
+                      value={dockerHealthPath}
+                      onChange={(e) => setDockerHealthPath(e.target.value)}
+                      className="w-16 bg-transparent text-sm font-mono outline-none text-foreground"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="w-px bg-cyber-border/60 self-stretch" />
 
+            {/* Toggles modules */}
             <div className="flex items-center gap-2 px-4 shrink-0">
               {[
                 {
-                  key: "sast",
-                  on: sastOn,
-                  set: setSastOn,
-                  icon: <Shield size={14} />,
-                  label: "SAST",
+                  key:         "sast",
+                  on:          sastOn,
+                  set:         setSastOn,
+                  icon:        <Shield size={14} />,
+                  label:       "SAST",
                   activeClass: "bg-blue-500/15 text-blue-400 border-blue-500/30",
+                  disabled:    sourceMode === "image",
                 },
                 {
-                  key: "dast",
-                  on: dastOn,
-                  set: setDastOn,
-                  icon: <Zap size={14} />,
-                  label: "DAST",
+                  key:         "dast",
+                  on:          dastOn,
+                  set:         setDastOn,
+                  icon:        <Zap size={14} />,
+                  label:       "DAST",
                   activeClass: "bg-red-500/15 text-red-400 border-red-500/30",
+                  disabled:    false,
                 },
                 {
-                  key: "cicd",
-                  on: cicdOn,
-                  set: setCicdOn,
-                  icon: <Code2 size={14} />,
-                  label: "CI/CD",
+                  key:         "cicd",
+                  on:          cicdOn,
+                  set:         setCicdOn,
+                  icon:        <Code2 size={14} />,
+                  label:       "CI/CD",
                   activeClass: "bg-teal-500/15 text-teal-400 border-teal-500/30",
+                  disabled:    sourceMode === "image",
                 },
-              ].map(({ key, on, set, icon, label, activeClass }) => (
+              ].map(({ key, on, set, icon, label, activeClass, disabled }) => (
                 <button
                   key={key}
-                  onClick={() => set(!on)}
+                  onClick={() => !disabled && set(!on)}
+                  disabled={disabled}
                   className={cn(
                     "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all border",
-                    on
+                    disabled
+                      ? "opacity-30 cursor-not-allowed text-muted-foreground border-transparent"
+                      : on
                       ? activeClass
                       : "text-muted-foreground border-transparent hover:border-cyber-border hover:text-foreground"
                   )}
@@ -479,6 +455,7 @@ export function CodeScan() {
 
             <div className="w-px bg-cyber-border/60 self-stretch" />
 
+            {/* Bouton lancer */}
             <button
               onClick={handleScan}
               disabled={!canScan()}
@@ -496,50 +473,45 @@ export function CodeScan() {
             </button>
           </div>
 
+          {/* Hints bas de barre */}
           <div className="px-5 py-3 flex items-center justify-between gap-4">
             <p className="text-xs text-muted-foreground">{sourceHints[sourceMode]}</p>
             {durationHint && (
-              <p className="text-xs text-muted-foreground shrink-0">
-                {durationHint}
-              </p>
+              <p className="text-xs text-muted-foreground shrink-0">{durationHint}</p>
             )}
           </div>
 
-          {dastOn && sourceMode !== "zip" && (
-            <div className="px-5 pb-4 border-t border-cyber-border/40 pt-4 flex items-center gap-4">
-              <span className="text-sm text-muted-foreground shrink-0">
-                Cible DAST :
-              </span>
+          {/* Avertissement DAST sandbox (mode Git ou ZIP) — sans WebGoat/DVWA */}
+          {dastOn && sourceMode !== "image" && (
+            <div className="px-5 pb-4 border-t border-cyber-border/40 pt-4 flex items-center gap-2 text-xs text-amber-400/80">
+              <AlertTriangle size={12} />
+              OWASP ZAP · Sandbox isolée · contrainte C-05
+            </div>
+          )}
 
-              {(["webgoat", "dvwa"] as DastTarget[]).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setDastTarget(t)}
-                  className={cn(
-                    "px-4 py-1.5 rounded-lg text-sm transition-all border",
-                    dastTarget === t
-                      ? "bg-red-500/15 text-red-400 border-red-500/30"
-                      : "text-muted-foreground border-cyber-border hover:text-foreground"
-                  )}
-                >
-                  {t === "webgoat" ? "WebGoat" : "DVWA"}
-                </button>
-              ))}
-
-              <div className="flex items-center gap-2 ml-2 text-xs text-amber-400/80">
-                <AlertTriangle size={12} />
-                Sandbox isolée · contrainte C-05
+          {/* Info mode Image Docker */}
+          {sourceMode === "image" && (
+            <div className="px-5 pb-4 border-t border-cyber-border/40 pt-4">
+              <div className="flex items-start gap-2 text-xs text-violet-400/80">
+                <Container size={13} className="shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-medium">Mode Production — Image Docker pré-buildée</span>
+                  <span className="text-muted-foreground ml-2">
+                    Workflow : Trivy image scan → déploiement sandbox-net → OWASP ZAP → teardown
+                  </span>
+                  <div className="mt-1 font-mono text-muted-foreground/60 text-[10px]">
+                    Commande : <code>docker build -t {dockerImage || "mon-app:scan"} .</code>
+                  </div>
+                </div>
               </div>
             </div>
           )}
 
+          {/* Zone drag & drop ZIP */}
           {sourceMode === "zip" && !zipFile && (
             <div
               onClick={() => fileInputRef.current?.click()}
-              onDragOver={(e) => {
-                e.preventDefault();
-                setIsDragging(true);
-              }}
+              onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
               onDragLeave={() => setIsDragging(false)}
               onDrop={(e) => {
                 e.preventDefault();
@@ -565,7 +537,8 @@ export function CodeScan() {
           )}
         </div>
 
-        {(sastOn || dastOn) && (
+        {/* Nom du projet */}
+        {(sastOn || dastOn) && sourceMode !== "image" && (
           <div className="flex items-center gap-3">
             <label className="text-sm text-muted-foreground shrink-0">
               Nom du projet
@@ -579,6 +552,7 @@ export function CodeScan() {
           </div>
         )}
 
+        {/* Cartes modules actifs */}
         {activeModules.length > 0 && (
           <div
             className={cn(
@@ -590,43 +564,51 @@ export function CodeScan() {
                 : "grid-cols-3"
             )}
           >
-            {sastOn && (
+            {sastOn && sourceMode !== "image" && (
               <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 p-5">
                 <div className="flex items-center gap-2 mb-3">
                   <Shield size={15} className="text-blue-400" />
-                  <span className="text-sm font-medium text-blue-400">
-                    Scan statique
-                  </span>
+                  <span className="text-sm font-medium text-blue-400">Scan statique</span>
                   <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/20">
                     M4
                   </span>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  Semgrep · Trivy · Gitleaks
+                <p className="text-xs text-muted-foreground">Semgrep · Trivy · Gitleaks</p>
+                <p className="text-xs text-muted-foreground mt-1">SARIF · MITRE ATT&CK mapping</p>
+              </div>
+            )}
+
+            {dastOn && sourceMode === "image" && (
+              <div className="rounded-xl border border-violet-500/20 bg-violet-500/5 p-5">
+                <div className="flex items-center gap-2 mb-3">
+                  <Container size={15} className="text-violet-400" />
+                  <span className="text-sm font-medium text-violet-400">Scan image Docker</span>
+                  <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-violet-500/15 text-violet-400 border border-violet-500/20">
+                    M5
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground">Trivy · OWASP ZAP · 6 phases</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Image : <span className="font-mono text-violet-400">{dockerImage || "—"}</span>
                 </p>
                 <p className="text-xs text-muted-foreground mt-1">
-                  SARIF · MITRE ATT&CK mapping
+                  Port : <span className="font-mono">{dockerPort}</span>
+                  {" "}· Healthcheck : <span className="font-mono">{dockerHealthPath}</span>
                 </p>
               </div>
             )}
 
-            {dastOn && (
+            {dastOn && sourceMode !== "image" && (
               <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-5">
                 <div className="flex items-center gap-2 mb-3">
                   <Zap size={15} className="text-red-400" />
-                  <span className="text-sm font-medium text-red-400">
-                    Scan dynamique
-                  </span>
+                  <span className="text-sm font-medium text-red-400">Scan dynamique</span>
                   <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/20">
                     M5
                   </span>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  OWASP ZAP · 6 phases
-                </p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Proof-of-exploit · PCAP labelisé
-                </p>
+                <p className="text-xs text-muted-foreground">OWASP ZAP · 6 phases</p>
+                <p className="text-xs text-muted-foreground mt-1">Proof-of-exploit · PCAP labelisé</p>
               </div>
             )}
 
@@ -634,33 +616,40 @@ export function CodeScan() {
               <div className="rounded-xl border border-teal-500/20 bg-teal-500/5 p-5">
                 <div className="flex items-center gap-2 mb-3">
                   <Code2 size={15} className="text-teal-400" />
-                  <span className="text-sm font-medium text-teal-400">
-                    Pipeline CI/CD
-                  </span>
+                  <span className="text-sm font-medium text-teal-400">Pipeline CI/CD</span>
                   <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-teal-500/15 text-teal-400 border border-teal-500/20">
                     M8
                   </span>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  GitHub Actions · Quality Gate
-                </p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Blocage automatique PR critiques
-                </p>
+                <p className="text-xs text-muted-foreground">GitHub Actions · Quality Gate</p>
+                <p className="text-xs text-muted-foreground mt-1">Blocage automatique PR critiques</p>
               </div>
             )}
           </div>
         )}
 
+        {(sastOn || dastOn) && (
+          <div className="rounded-xl border border-purple-500/20 bg-purple-500/5 p-5">
+            <div className="flex items-center gap-2 mb-2">
+              <BrainCircuit size={15} className="text-purple-400" />
+              <span className="text-sm font-medium text-purple-400">Assistant LLM vulnérabilités</span>
+              <span className="ml-auto text-[10px] font-mono px-2 py-0.5 rounded bg-purple-500/15 text-purple-400 border border-purple-500/20">
+                SAST + DAST
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Après le scan, chaque finding peut être expliqué : résumé simple, impact, preuve, priorité et correction recommandée.
+            </p>
+          </div>
+        )}
+
+        {/* Bandeau erreur */}
         {status === "error" && error && (
           <div className="flex items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/8 p-4 text-red-300">
             <AlertTriangle size={16} className="shrink-0" />
             <p className="text-sm">{error}</p>
             <button
-              onClick={() => {
-                setError("");
-                setStatus("idle");
-              }}
+              onClick={() => { setError(""); setStatus("idle"); }}
               className="ml-auto text-red-300/60 hover:text-red-300"
             >
               <X size={14} />

@@ -18,12 +18,14 @@ import {
   Download,
   Filter,
   Search,
+  BrainCircuit,
+  X,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
 import { cn } from "../lib/utils";
-import { sastAPI } from "../services/api";
+import { sastAPI, vulnerabilityLLMAPI } from "../services/api";
 
 const scannerIcons = {
   semgrep:  <FileCode size={16} />,
@@ -45,7 +47,88 @@ function normalizeSeverity(sev?: string) {
   return "low";
 }
 
-function FindingRow({ finding }: { finding: any }) {
+
+function LLMExplanationPanel({
+  explanation,
+  loading,
+  onClose,
+}: {
+  explanation: any | null;
+  loading: boolean;
+  onClose: () => void;
+}) {
+  if (!loading && !explanation) return null;
+
+  return (
+    <Card className="bg-purple-500/5 border-purple-500/25">
+      <CardHeader className="pb-2">
+        <div className="flex items-center justify-between gap-3">
+          <CardTitle className="text-sm flex items-center gap-2 text-purple-300">
+            <BrainCircuit size={15} />
+            Explication LLM
+          </CardTitle>
+          <Button variant="ghost" size="sm" onClick={onClose} className="h-7 px-2">
+            <X size={14} />
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {loading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground py-3">
+            <Loader2 size={15} className="animate-spin" />
+            Génération de l'explication...
+          </div>
+        ) : (
+          <div className="space-y-3 text-sm">
+            <div>
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Résumé</p>
+              <p className="mt-1">{explanation?.resume_simple || "—"}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Description technique</p>
+              <p className="mt-1 text-muted-foreground">{explanation?.description_technique || "—"}</p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="rounded-lg border border-cyber-border bg-card/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">Impact</p>
+                <p className="mt-1 text-muted-foreground">{explanation?.impact || "—"}</p>
+              </div>
+              <div className="rounded-lg border border-cyber-border bg-card/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">Cause probable</p>
+                <p className="mt-1 text-muted-foreground">{explanation?.cause_probable || "—"}</p>
+              </div>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Correction recommandée</p>
+              <p className="mt-1 text-muted-foreground">{explanation?.correction_recommandee || "—"}</p>
+            </div>
+            {explanation?.exemple_correction && (
+              <pre className="rounded-lg bg-cyber-darker p-3 text-xs overflow-auto text-muted-foreground whitespace-pre-wrap">
+                {explanation.exemple_correction}
+              </pre>
+            )}
+            <div className="flex flex-wrap gap-2 text-xs">
+              <span className="rounded-full border border-purple-500/30 bg-purple-500/10 px-2 py-1 text-purple-300">
+                Risque : {explanation?.niveau_risque || "—"}
+              </span>
+              <span className="rounded-full border border-blue-500/30 bg-blue-500/10 px-2 py-1 text-blue-300">
+                Priorité : {explanation?.priorite_correction || "—"}
+              </span>
+              <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-amber-300">
+                Faux positif : {explanation?.faux_positif_possible ? "possible" : "peu probable"}
+              </span>
+            </div>
+            {explanation?.raison_faux_positif && (
+              <p className="text-xs text-muted-foreground">{explanation.raison_faux_positif}</p>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function FindingRow({ finding, onExplain }: { finding: any; onExplain: (finding: any) => void }) {
   const severity = normalizeSeverity(finding.severity);
 
   return (
@@ -94,7 +177,7 @@ function FindingRow({ finding }: { finding: any }) {
           </div>
         </div>
 
-        <Button variant="ghost" size="sm" className="shrink-0">Voir</Button>
+        <Button variant="ghost" size="sm" onClick={() => onExplain(finding)} className="shrink-0 gap-1"><BrainCircuit size={13} />Expliquer</Button>
       </div>
     </div>
   );
@@ -138,6 +221,10 @@ export default function SASTScanner() {
   const [data,        setData]        = useState<any[]>([]);
   const [scanId,      setScanId]      = useState<string | null>(null);
 
+  const [llmLoading, setLlmLoading] = useState(false);
+  const [llmExplanation, setLlmExplanation] = useState<any | null>(null);
+  const [llmError, setLlmError] = useState("");
+
   const loadData = async () => {
     setLoading(true);
     try {
@@ -180,6 +267,32 @@ export default function SASTScanner() {
   }, [location.state]);
 
   const handleLaunchScan = () => navigate("/scan-code");
+
+  const explainFinding = async (finding: any) => {
+    setLlmLoading(true);
+    setLlmExplanation(null);
+    setLlmError("");
+    try {
+      const result = await vulnerabilityLLMAPI.explain("sast", finding);
+      setLlmExplanation(result.explanation);
+    } catch (e: any) {
+      setLlmError(e?.message || "Erreur LLM");
+      setLlmExplanation({
+        resume_simple: "Impossible de générer l'explication LLM.",
+        description_technique: "Le service LLM est indisponible ou la réponse n'est pas exploitable.",
+        impact: "Non disponible.",
+        cause_probable: "Non disponible.",
+        correction_recommandee: "Vérifier Ollama, le backend et l'endpoint /api/vulnerabilities/llm/explain.",
+        exemple_correction: "ollama run llama3.1:8b",
+        niveau_risque: finding?.severity || "INFO",
+        priorite_correction: "P4",
+        faux_positif_possible: true,
+        raison_faux_positif: e?.message || "Analyse LLM non disponible.",
+      });
+    } finally {
+      setLlmLoading(false);
+    }
+  };
 
   const filteredFindings = useMemo(() => {
     const text = searchQuery.toLowerCase();
@@ -267,6 +380,18 @@ export default function SASTScanner() {
         </Card>
       </div>
 
+      {llmError && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/8 p-3 text-sm text-red-300">
+          {llmError}
+        </div>
+      )}
+
+      <LLMExplanationPanel
+        explanation={llmExplanation}
+        loading={llmLoading}
+        onClose={() => { setLlmExplanation(null); setLlmError(""); }}
+      />
+
       {/* Liste findings */}
       <Card className="bg-card/50 border-cyber-border">
         <CardHeader className="pb-2">
@@ -290,7 +415,7 @@ export default function SASTScanner() {
           <div className="max-h-96 overflow-auto">
             <div className="space-y-2">
               {filteredFindings.map((finding, index) => (
-                <FindingRow key={finding.id || index} finding={finding} />
+                <FindingRow key={finding.id || index} finding={finding} onExplain={explainFinding} />
               ))}
               {!loading && filteredFindings.length === 0 && (
                 <div className="text-sm text-muted-foreground py-6 text-center">

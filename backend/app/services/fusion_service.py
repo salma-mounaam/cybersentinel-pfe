@@ -56,6 +56,7 @@ class FusionEngine:
                 encoding="utf-8",
                 decode_responses=True,
             )
+            logger.info("PIPELINE_TRACE | REDIS | connexion Redis initialisée")
         return self.redis
 
     async def process_suricata_alert(self, alert: Alert, raw_event: dict) -> Alert:
@@ -69,6 +70,14 @@ class FusionEngine:
                 f"attack_type={getattr(alert, 'attack_type', None)}"
             )
 
+            logger.info(
+                "PIPELINE_TRACE | 6 | M3 reçu | alert_id=%s src=%s dest=%s signature=%s",
+                getattr(alert, "id", None),
+                getattr(alert, "src_ip", None),
+                getattr(alert, "dest_ip", None),
+                getattr(alert, "signature_name", None),
+            )
+
             if alert.suricata_score is None or alert.suricata_score == 0:
                 alert.suricata_score = 0.70
                 logger.info(
@@ -76,18 +85,52 @@ class FusionEngine:
                     f"alert_id={alert.id}"
                 )
 
+            logger.info(
+                "PIPELINE_TRACE | 6.1 | Score Suricata prêt | alert_id=%s suricata_score=%.4f",
+                alert.id,
+                alert.suricata_score or 0.0,
+            )
+
             ml_result = await self.ml_engine.score_event(raw_event)
             ml_score = ml_result["ensemble_score"] if ml_result else 0.0
+
+            logger.info(
+                "PIPELINE_TRACE | 7 | ML terminé | alert_id=%s ml_score=%.4f if=%s ae=%s ocsvm=%s is_anomaly=%s threshold=%s",
+                alert.id,
+                ml_score,
+                ml_result.get("if_score") if ml_result else None,
+                ml_result.get("ae_score") if ml_result else None,
+                ml_result.get("ocsvm_score") if ml_result else None,
+                ml_result.get("is_anomaly") if ml_result else None,
+                ml_result.get("decision_threshold") if ml_result else None,
+            )
 
             context_score = self._compute_context_score(
                 alert.src_ip,
                 alert.detected_at or datetime.now(timezone.utc),
             )
 
+            logger.info(
+                "PIPELINE_TRACE | 8 | Contexte calculé | alert_id=%s src=%s context_score=%.2f",
+                alert.id,
+                alert.src_ip,
+                context_score,
+            )
+
             fusion_case = self._determine_case(
                 s_score=alert.suricata_score or 0.0,
                 m_score=ml_score,
                 c_score=context_score,
+            )
+
+            logger.info(
+                "PIPELINE_TRACE | 8.1 | Cas fusion calculé | alert_id=%s S=%.4f M=%.4f C=%.4f case=%s label=%s",
+                alert.id,
+                alert.suricata_score or 0.0,
+                ml_score,
+                context_score,
+                fusion_case,
+                FUSION_CASES.get(fusion_case, {}).get("label", "Unknown"),
             )
 
             if fusion_case == 5:
@@ -99,6 +142,15 @@ class FusionEngine:
                     f"C={context_score:.4f} "
                     f"src={alert.src_ip}"
                 )
+
+                logger.info(
+                    "PIPELINE_TRACE | X | Cas 5 bruit ignoré | alert_id=%s S=%.4f M=%.4f C=%.4f",
+                    alert.id,
+                    alert.suricata_score or 0.0,
+                    ml_score,
+                    context_score,
+                )
+
                 return alert
 
             confidence = (
@@ -109,6 +161,14 @@ class FusionEngine:
             confidence = round(min(confidence, 1.0), 4)
 
             severity = self._confidence_to_severity(confidence)
+
+            logger.info(
+                "PIPELINE_TRACE | 9 | Fusion décidée | alert_id=%s case=%s confidence=%.4f severity=%s",
+                alert.id,
+                fusion_case,
+                confidence,
+                severity.value,
+            )
 
             alert.ml_score = round(ml_score, 4)
             alert.confidence = confidence
@@ -123,14 +183,39 @@ class FusionEngine:
 
             await self._update_alert(alert)
 
+            logger.info(
+                "PIPELINE_TRACE | 10 | DB mise à jour après fusion | alert_id=%s ml_score=%.4f confidence=%.4f case=%s",
+                alert.id,
+                alert.ml_score or 0.0,
+                alert.confidence or 0.0,
+                alert.fusion_case,
+            )
+
             try:
                 await self._publish_fused_alert(alert)
+
+                logger.info(
+                    "PIPELINE_TRACE | 10.1 | Redis channel:alerts publié | alert_id=%s",
+                    alert.id,
+                )
+
             except Exception:
                 logger.exception(
                     "M3 Fusion | Redis channel:alerts échoué, mais incident continue"
                 )
+                logger.exception(
+                    "PIPELINE_TRACE | X | Redis channel:alerts échoué | alert_id=%s",
+                    alert.id,
+                )
 
             await self._trigger_incident_creation(alert)
+
+            logger.info(
+                "PIPELINE_TRACE | 11 | Incident demandé | alert_id=%s severity=%s confidence=%.4f",
+                alert.id,
+                alert.severity.value,
+                alert.confidence or 0.0,
+            )
 
             logger.info(
                 f"M3 Fusion | Cas {fusion_case} | "
@@ -149,6 +234,10 @@ class FusionEngine:
                 f"alert_id={getattr(alert, 'id', None)} "
                 f"src={getattr(alert, 'src_ip', None)} "
                 f"dest={getattr(alert, 'dest_ip', None)}"
+            )
+            logger.exception(
+                "PIPELINE_TRACE | X | CRASH M3 process_suricata_alert | alert_id=%s",
+                getattr(alert, "id", None),
             )
             raise
 
@@ -184,6 +273,13 @@ class FusionEngine:
         count = len(self._temporal_window[src_ip])
         score = min((count - 1) * 0.30, 1.0)
 
+        logger.info(
+            "PIPELINE_TRACE | 8.0 | Fenêtre temporelle | src=%s count=%s score=%.2f",
+            src_ip,
+            count,
+            score,
+        )
+
         return round(score, 2)
 
     def _confidence_to_severity(self, confidence: float) -> SeverityLevel:
@@ -206,6 +302,10 @@ class FusionEngine:
                     logger.warning(
                         f"M3 Fusion | Alerte introuvable en DB | alert_id={alert.id}"
                     )
+                    logger.warning(
+                        "PIPELINE_TRACE | X | Alerte introuvable DB | alert_id=%s",
+                        alert.id,
+                    )
                     return
 
                 db_alert.ml_score = alert.ml_score
@@ -218,7 +318,6 @@ class FusionEngine:
                 db_alert.ae_score = alert.ae_score
                 db_alert.suricata_score = alert.suricata_score
 
-                # IMPORTANT : garder le type d'attaque LLM
                 db_alert.attack_type = alert.attack_type
 
                 await session.commit()
@@ -230,6 +329,10 @@ class FusionEngine:
 
         except Exception:
             logger.exception("M3 Fusion | Erreur mise à jour alerte fusionnée")
+            logger.exception(
+                "PIPELINE_TRACE | X | Erreur update DB fusion | alert_id=%s",
+                getattr(alert, "id", None),
+            )
             raise
 
     async def _publish_fused_alert(self, alert: Alert):

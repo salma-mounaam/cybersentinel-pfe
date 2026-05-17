@@ -1,6 +1,12 @@
 // ============================================================
 // services/api.ts — Tous les appels HTTP vers le backend réel
 // Base URL configurable via variable d'env
+//
+// Version modifiée :
+//   - Ajout API LLM pour expliquer les vulnérabilités SAST / DAST
+//   - Endpoints :
+//       POST /api/vulnerabilities/llm/explain
+//       POST /api/vulnerabilities/llm/explain-many
 // ============================================================
 
 const API_BASE =
@@ -37,6 +43,7 @@ async function post<T>(url: string, body?: any): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
+
   return parseJsonSafe<T>(res, "POST", url);
 }
 
@@ -46,6 +53,7 @@ async function patch<T>(url: string, body: any): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+
   return parseJsonSafe<T>(res, "PATCH", url);
 }
 
@@ -54,6 +62,7 @@ async function postForm<T>(url: string, formData: FormData): Promise<T> {
     method: "POST",
     body: formData,
   });
+
   return parseJsonSafe<T>(res, "POST", url);
 }
 
@@ -70,31 +79,42 @@ export const alertsAPI = {
     if (params?.offset !== undefined) q.set("offset", String(params.offset));
 
     const qs = q.toString();
+
     return get<{ total: number; alerts: any[] }>(
       `/alerts/${qs ? `?${qs}` : ""}`
     );
   },
 
   getStats: () => get<any>("/alerts/stats"),
+
   getById: (id: number) => get<any>(`/alerts/${id}`),
 };
 
 // ── M2/M10 ML ────────────────────────────────────────────────
 export const mlAPI = {
   getStatus: () => get<any>("/ml/status"),
+
   triggerTraining: () => post<any>("/ml/train"),
+
   trainSync: () => post<any>("/ml/train/sync"),
+
   getLoaoResults: () => get<any>("/ml/loao-results"),
+
   getRegistry: () => get<any>("/ml/registry"),
+
   getH3: () => get<any>("/ml/h3-validation"),
+
   getReports: () => get<any>("/ml/training-reports"),
+
   rollback: () => post<any>("/ml/rollback"),
+
   deployVersion: (v: string) => post<any>(`/ml/deploy/${v}`),
 };
 
 // ── M3 Fusion ────────────────────────────────────────────────
 export const fusionAPI = {
   getStats: () => get<any>("/fusion/stats"),
+
   validateH2: (fpr_before: number, fpr_after: number) =>
     post<any>("/fusion/validate-h2", {
       fpr_signature: fpr_before,
@@ -105,7 +125,11 @@ export const fusionAPI = {
 // ── M4 SAST ──────────────────────────────────────────────────
 export const sastAPI = {
   scan: (repo_path: string, repo_name = "", commit_sha = "") =>
-    post<any>("/sast/scan", { repo_path, repo_name, commit_sha }),
+    post<any>("/sast/scan", {
+      repo_path,
+      repo_name,
+      commit_sha,
+    }),
 
   scanSync: (
     repo_path: string,
@@ -122,9 +146,17 @@ export const sastAPI = {
 
   uploadScan: (file: File, project_name = "", commit_sha = "") => {
     const formData = new FormData();
+
     formData.append("file", file);
-    if (project_name) formData.append("project_name", project_name);
-    if (commit_sha) formData.append("commit_sha", commit_sha);
+
+    if (project_name) {
+      formData.append("project_name", project_name);
+    }
+
+    if (commit_sha) {
+      formData.append("commit_sha", commit_sha);
+    }
+
     return postForm<any>("/sast/scan/upload", formData);
   },
 
@@ -161,6 +193,7 @@ export const sastAPI = {
     if (params?.offset !== undefined) q.set("offset", String(params.offset));
 
     const qs = q.toString();
+
     return get<{ total: number; findings: any[] }>(
       `/sast/findings${qs ? `?${qs}` : ""}`
     );
@@ -168,7 +201,9 @@ export const sastAPI = {
 
   getStats: (params?: { scan_id?: string }) => {
     const q = new URLSearchParams();
+
     if (params?.scan_id) q.set("scan_id", params.scan_id);
+
     const qs = q.toString();
 
     return get<any>(`/sast/stats${qs ? `?${qs}` : ""}`);
@@ -187,6 +222,7 @@ export const sastAPI = {
 // ── M5 DAST ──────────────────────────────────────────────────
 export const dastAPI = {
   getStatus: () => get<any>("/dast/status"),
+
   verifyIsolation: () => get<any>("/dast/isolation/verify"),
 
   startSync: (payload: {
@@ -201,15 +237,142 @@ export const dastAPI = {
     deploy_target?: boolean;
   }) => post<any>("/dast/start", payload),
 
-  getFindings: (limit = 50) => get<any>(`/dast/findings?limit=${limit}`),
+  // ── Mode ZIP — upload projet → build → sandbox → ZAP ───────
+  startFromUpload: (file: File) => {
+    const formData = new FormData();
+
+    formData.append("file", file);
+
+    return postForm<any>("/dast/start/from-upload", formData);
+  },
+
+  // ── Mode Image Docker pré-buildée ──────────────────────────
+  startFromImage: (payload: {
+    image: string;
+    port?: number;
+    healthcheck_path?: string;
+    scan_profile?: string;
+  }) => post<any>("/dast/start/from-image", payload),
+
+  // ── Mode GitHub → clone → build → sandbox → ZAP ────────────
+  startFromGit: (payload: {
+    repo_url: string;
+    branch?: string;
+    project_name?: string;
+  }) => post<any>("/dast/start/from-git", payload),
+
+  getFindings: (limit = 50, session_id?: string) => {
+    const q = new URLSearchParams();
+
+    q.set("limit", String(limit));
+
+    if (session_id) {
+      q.set("session_id", session_id);
+    }
+
+    return get<any>(`/dast/findings?${q.toString()}`);
+  },
+
+  getFindingsHistory: (limit = 100) =>
+    get<any>(`/dast/findings/history?limit=${limit}`),
+};
+
+// ── LLM — Explication des vulnérabilités SAST / DAST ─────────
+export type VulnerabilitySource = "sast" | "dast";
+
+export type VulnerabilityLLMExplanation = {
+  resume_simple: string;
+  description_technique: string;
+  impact: string;
+  cause_probable: string;
+  preuve_observee: string;
+  niveau_risque: "CRITIQUE" | "ELEVE" | "MOYEN" | "FAIBLE" | "INFO" | string;
+  priorite_correction: "P1" | "P2" | "P3" | "P4" | string;
+  correction_recommandee: string;
+  exemple_correction: string;
+  faux_positif_possible: boolean;
+  raison_faux_positif: string;
+  mapping?: {
+    cwe?: string | null;
+    owasp?: string | null;
+    mitre?: string | null;
+  };
+};
+
+export type VulnerabilityLLMResponse = {
+  success: boolean;
+  source: VulnerabilitySource;
+  model?: string;
+  error?: string;
+  explanation: VulnerabilityLLMExplanation;
+};
+
+export type VulnerabilityLLMManyResponse = {
+  success: boolean;
+  source: VulnerabilitySource;
+  count: number;
+  limit: number;
+  items: Array<{
+    finding: any;
+    llm: VulnerabilityLLMResponse;
+  }>;
+};
+
+export const vulnerabilityLLMAPI = {
+  explain: (source: VulnerabilitySource, finding: any) =>
+    post<VulnerabilityLLMResponse>("/vulnerabilities/llm/explain", {
+      source,
+      finding,
+    }),
+
+  explainSAST: (finding: any) =>
+    post<VulnerabilityLLMResponse>("/vulnerabilities/llm/explain", {
+      source: "sast",
+      finding,
+    }),
+
+  explainDAST: (finding: any) =>
+    post<VulnerabilityLLMResponse>("/vulnerabilities/llm/explain", {
+      source: "dast",
+      finding,
+    }),
+
+  explainMany: (
+    source: VulnerabilitySource,
+    findings: any[],
+    limit: number = 20
+  ) =>
+    post<VulnerabilityLLMManyResponse>("/vulnerabilities/llm/explain-many", {
+      source,
+      findings,
+      limit,
+    }),
+
+  explainManySAST: (findings: any[], limit: number = 20) =>
+    post<VulnerabilityLLMManyResponse>("/vulnerabilities/llm/explain-many", {
+      source: "sast",
+      findings,
+      limit,
+    }),
+
+  explainManyDAST: (findings: any[], limit: number = 20) =>
+    post<VulnerabilityLLMManyResponse>("/vulnerabilities/llm/explain-many", {
+      source: "dast",
+      findings,
+      limit,
+    }),
 };
 
 // ── M6 MITRE ─────────────────────────────────────────────────
 export const mitreAPI = {
   getTechnique: (id: string) => get<any>(`/mitre/technique/${id}`),
+
   listTechniques: () => get<any>("/mitre/techniques"),
+
   getMatrix: () => get<any>("/mitre/matrix"),
+
   getCweMapping: () => get<any>("/mitre/cwe-mapping"),
+
   enrich: (alert: any) => post<any>("/mitre/enrich", alert),
 };
 
@@ -235,15 +398,20 @@ export const incidentsAPI = {
     if (params?.offset !== undefined) q.set("offset", String(params.offset));
 
     const qs = q.toString();
+
     return get<any>(`/incidents/${qs ? `?${qs}` : ""}`);
   },
 
   getStats: () => get<any>("/incidents/stats"),
+
   getCritical: () => get<any>("/incidents/critical"),
+
   getById: (id: number) => get<any>(`/incidents/${id}`),
 
   updateStatus: (id: number, status: string) =>
-    patch<any>(`/incidents/${id}/status`, { status }),
+    patch<any>(`/incidents/${id}/status`, {
+      status,
+    }),
 
   computeR: (data: {
     anomaly_score: number;
@@ -262,21 +430,87 @@ export const incidentsAPI = {
 // ── Scoring ──────────────────────────────────────────────────
 export const scoringAPI = {
   getWeights: () => get<any>("/scoring/weights"),
+
   getSLA: () => get<any>("/scoring/sla"),
+
   getAssetCriticality: () => get<any>("/scoring/asset-criticality"),
 };
 
 // ── M8 CI/CD ─────────────────────────────────────────────────
 export const cicdAPI = {
   getRuns: () => get<any>("/cicd/runs"),
+
   getGateConfig: () => get<any>("/cicd/quality-gate/config"),
+
   getIntegGuide: () => get<any>("/cicd/integration-guide"),
+
   sendWebhook: (data: any) => post<any>("/cicd/webhook", data),
+
   scanRepo: (repo_url: string, branch = "main") =>
-    post<any>("/cicd/scan/repo", { repo_url, branch }),
+    post<any>("/cicd/scan/repo", {
+      repo_url,
+      branch,
+    }),
+
   submitResults: (data: any) => post<any>("/cicd/submit-results", data),
 };
+// ── Reports LLM — Rapports narratifs CyberSentinel ───────────
 
+export type LLMReportType =
+  | "security_summary"
+  | "incident_analysis"
+  | "sast_dast_summary"
+  | "executive_briefing";
+
+export type LLMReportLanguage = "fr" | "en";
+
+export type LLMReportRequest = {
+  report_type: LLMReportType;
+  language?: LLMReportLanguage;
+  period_days?: number;
+  incident_id?: number | null;
+};
+
+export type LLMReportResponse = {
+  success: boolean;
+  report_type: LLMReportType;
+  generated_at: string;
+  period_days: number;
+  incident_id?: number | null;
+  markdown: string;
+  stats: {
+    counts?: {
+      alerts?: number;
+      incidents?: number;
+      open_incidents?: number;
+      sla_overdue?: number;
+      sast_findings?: number;
+      dast_findings?: number;
+      dast_confirmed_sast?: number;
+      [key: string]: any;
+    };
+    aggregates?: any;
+    selected_incident?: any;
+    [key: string]: any;
+  };
+  model: string;
+};
+
+export type LLMReportTypesResponse = {
+  types: Array<{
+    id: LLMReportType;
+    label: string;
+    description: string;
+    incident_id_required: boolean;
+  }>;
+};
+
+export const reportsAPI = {
+  analyze: (payload: LLMReportRequest) =>
+    post<LLMReportResponse>("/reports/analyze", payload),
+
+  getTypes: () => get<LLMReportTypesResponse>("/reports/types"),
+};
 // ── Health ───────────────────────────────────────────────────
 export const healthAPI = {
   check: async () => {
@@ -284,6 +518,7 @@ export const healthAPI = {
       process.env.REACT_APP_API_ROOT?.replace(/\/$/, "") ||
         "http://localhost:8000/health"
     );
+
     return res.json();
   },
 };

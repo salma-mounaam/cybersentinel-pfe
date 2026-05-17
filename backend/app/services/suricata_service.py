@@ -117,6 +117,7 @@ class SuricataEveWatcher:
         )
         self._running = True
         logger.info("👁️ Suricata watcher démarré — %s", self.eve_path)
+        logger.info("PIPELINE_TRACE | START | Suricata watcher actif | eve_path=%s", self.eve_path)
         await self._tail_eve_log()
 
     async def stop(self):
@@ -124,6 +125,7 @@ class SuricataEveWatcher:
         if self.redis:
             await self.redis.aclose()
         logger.info("Suricata watcher arrêté")
+        logger.info("PIPELINE_TRACE | STOP | Suricata watcher arrêté")
 
     async def _tail_eve_log(self):
         while not self.eve_path.exists() and self._running:
@@ -133,6 +135,7 @@ class SuricataEveWatcher:
         with open(self.eve_path, "r") as f:
             f.seek(0, 2)
             logger.info("eve.json ouvert — écoute des nouvelles alertes")
+            logger.info("PIPELINE_TRACE | 0 | eve.json ouvert | path=%s", self.eve_path)
 
             while self._running:
                 line = f.readline()
@@ -146,30 +149,62 @@ class SuricataEveWatcher:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            logger.warning("PIPELINE_TRACE | X | ligne JSON invalide ignorée")
             return
+
+        logger.info(
+            "PIPELINE_TRACE | 1 | eve.json reçu | event_type=%s",
+            event.get("event_type"),
+        )
 
         if event.get("event_type") != "alert":
             return
 
         alert_data = event.get("alert", {})
         if not alert_data:
+            logger.warning("PIPELINE_TRACE | X | event alert sans bloc alert ignoré")
             return
 
         signature_name = alert_data.get("signature", "Unknown")
         src_ip = event.get("src_ip", "")
         dest_ip = event.get("dest_ip", "")
 
+        logger.info(
+            "PIPELINE_TRACE | 2 | alerte Suricata détectée | src=%s dest=%s signature=%s",
+            src_ip,
+            dest_ip,
+            signature_name,
+        )
+
         if _is_noise_signature(signature_name):
             logger.info("🔇 Bruit Suricata ignoré : %s", signature_name)
+            logger.info(
+                "PIPELINE_TRACE | X | bruit Suricata ignoré | signature=%s",
+                signature_name,
+            )
             return
 
         if _is_duplicate(src_ip, dest_ip, signature_name):
             logger.info("🔁 Doublon ignoré : %s → %s | %s", src_ip, dest_ip, signature_name)
+            logger.info(
+                "PIPELINE_TRACE | X | doublon ignoré | src=%s dest=%s signature=%s",
+                src_ip,
+                dest_ip,
+                signature_name,
+            )
             return
 
         alert = await self._build_alert(event, alert_data)
         if not alert:
+            logger.error("PIPELINE_TRACE | X | construction Alert échouée")
             return
+
+        logger.info(
+            "PIPELINE_TRACE | 3 | Alert construite | severity=%s suricata_score=%.2f attack_type=%s",
+            alert.severity.value,
+            alert.suricata_score or 0.0,
+            alert.attack_type or "Unknown",
+        )
 
         alert_id = await self._save_alert(alert)
 
@@ -179,9 +214,24 @@ class SuricataEveWatcher:
                 alert.src_ip,
                 alert.signature_name,
             )
+            logger.error(
+                "PIPELINE_TRACE | X | sauvegarde DB échouée | src=%s signature=%s",
+                alert.src_ip,
+                alert.signature_name,
+            )
             return
 
         alert.id = alert_id
+
+        logger.info(
+            "PIPELINE_TRACE | 4 | Alert sauvegardée DB | alert_id=%s",
+            alert.id,
+        )
+
+        logger.info(
+            "PIPELINE_TRACE | 5 | Envoi vers M3 Fusion | alert_id=%s",
+            alert.id,
+        )
 
         await self.fusion_engine.process_suricata_alert(alert, event)
 
@@ -193,6 +243,11 @@ class SuricataEveWatcher:
             alert.dest_ip,
             alert.signature_name,
             alert.attack_type or "Unknown",
+        )
+
+        logger.info(
+            "PIPELINE_TRACE | 12 | Fin pipeline M1→M3 | alert_id=%s",
+            alert.id,
         )
 
     async def _build_alert(self, event: dict, alert_data: dict) -> Optional[Alert]:
@@ -207,13 +262,31 @@ class SuricataEveWatcher:
             raw_metadata = alert_data.get("metadata", {})
             technique_id = _extract_technique_from_metadata(raw_metadata)
 
+            logger.info(
+                "PIPELINE_TRACE | 2.1 | MITRE extraction | signature_id=%s technique_metadata=%s",
+                signature_id,
+                technique_id,
+            )
+
             if not technique_id:
                 technique_id = self.mitre_engine.resolve_suricata_fallback(
                     signature_id,
                     category,
                 )
 
+            logger.info(
+                "PIPELINE_TRACE | 2.2 | MITRE fallback/résolution | technique_id=%s category=%s",
+                technique_id,
+                category,
+            )
+
             mitre_data = await self.mitre_engine.enrich_by_technique_id(technique_id)
+
+            logger.info(
+                "PIPELINE_TRACE | 2.3 | MITRE enrichi | technique=%s tactic=%s",
+                mitre_data.get("technique_id"),
+                mitre_data.get("tactic"),
+            )
 
             suricata_score = {
                 1: 1.0,
@@ -252,8 +325,19 @@ class SuricataEveWatcher:
                     classification.get("reasoning", ""),
                 )
 
+                logger.info(
+                    "PIPELINE_TRACE | 2.4 | LLM classification | signature=%s attack_type=%s confidence=%.2f",
+                    signature_name,
+                    attack_type,
+                    classification.get("confidence", 0),
+                )
+
             except Exception as e:
                 logger.warning("LLM classification ignorée: %s", e)
+                logger.warning(
+                    "PIPELINE_TRACE | 2.4 | LLM classification ignorée | error=%s",
+                    e,
+                )
 
             return Alert(
                 source=AlertSource.M1_SURICATA,
@@ -286,6 +370,7 @@ class SuricataEveWatcher:
 
         except Exception as e:
             logger.error("Erreur construction alerte: %s", e, exc_info=True)
+            logger.error("PIPELINE_TRACE | X | erreur construction Alert | error=%s", e)
             return None
 
     async def _save_alert(self, alert: Alert) -> Optional[int]:
@@ -297,4 +382,5 @@ class SuricataEveWatcher:
                 return alert.id
         except Exception as e:
             logger.error("Erreur insertion PostgreSQL: %s", e, exc_info=True)
+            logger.error("PIPELINE_TRACE | X | erreur insertion PostgreSQL | error=%s", e)
             return None

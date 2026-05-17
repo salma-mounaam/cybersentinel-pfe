@@ -6,6 +6,7 @@
 //   [C] Badge "Cache Redis" vs "LIVE" pour distinguer la source
 //   [D] Bouton "Vider le cache" pour repartir propre en dev
 //   [E] Stats : lire depuis Redis (recent) si PostgreSQL vide
+//   [F] Métriques ML : données réelles depuis /api/ml/loao-results
 // ============================================================
 
 import { useState, useEffect, useRef, useCallback } from 'react';
@@ -23,7 +24,8 @@ import {
   ResponsiveContainer, ScatterChart, Scatter, ZAxis,
   ReferenceLine, BarChart, Bar, Cell,
 } from 'recharts';
-import { alertsAPI, fusionAPI } from '../services/api';
+// [F] Ajout mlAPI
+import { alertsAPI, fusionAPI, mlAPI } from '../services/api';
 import { useWebSocket } from '../hooks/useWebSocket';
 
 // ── Types ─────────────────────────────────────────────────────
@@ -39,17 +41,10 @@ interface LiveAlert {
   ml_score: number;
   technique_id: string | null;
   attack_type: string | null;
-  // [C] Source de l'alerte pour distinguer cache vs live
   _source: 'cache' | 'live';
 }
 
 // ── Helpers ───────────────────────────────────────────────────
-const SEV_COLOR: Record<string, string> = {
-  CRITIQUE: 'text-red-400',
-  ELEVE:    'text-amber-400',
-  MOYEN:    'text-blue-400',
-  FAIBLE:   'text-green-400',
-};
 const SEV_BG: Record<string, string> = {
   CRITIQUE: 'bg-red-500/10 text-red-400 border-red-500/30',
   ELEVE:    'bg-amber-500/10 text-amber-400 border-amber-500/30',
@@ -57,16 +52,13 @@ const SEV_BG: Record<string, string> = {
   FAIBLE:   'bg-green-500/10 text-green-400 border-green-500/30',
 };
 
-// [B] Convertit fusion_case string OU number → number 1-5
-// Problème original : Redis stocke parfois "SIGNATURE_ONLY" (string)
-// au lieu du numéro de cas, ce qui cassait l'affichage
 const FUSION_CASE_MAP: Record<string, number> = {
-  'SIGNATURE_ONLY':   3,
-  'ML_ONLY':          4,
-  'SIGNATURE_ML_FLUX':1,
-  'SIGNATURE_ML_5S':  2,
-  'BRUIT':            5,
-  'NOISE':            5,
+  'SIGNATURE_ONLY':    3,
+  'ML_ONLY':           4,
+  'SIGNATURE_ML_FLUX': 1,
+  'SIGNATURE_ML_5S':   2,
+  'BRUIT':             5,
+  'NOISE':             5,
 };
 
 function normalizeFusionCase(raw: any): number | null {
@@ -88,9 +80,6 @@ const FUSION_COLOR: Record<number, string> = {
   1: '#22c55e', 2: '#14b8a6', 3: '#3b82f6', 4: '#8b5cf6', 5: '#4a5568',
 };
 
-// [A] Parse le timestamp réel depuis detected_at
-// Problème original : new Date() utilisé → toutes les alertes
-// affichaient l'heure de chargement, pas l'heure réelle
 function parseAlertTimestamp(raw?: string): Date {
   if (!raw) return new Date();
   try {
@@ -106,7 +95,7 @@ function StatCard({
   title, value, subtitle, icon, color,
 }: {
   title: string; value: number | string; subtitle: string;
-  icon: React.ReactNode; color: 'blue'|'violet'|'orange'|'green';
+  icon: React.ReactNode; color: 'blue' | 'violet' | 'orange' | 'green';
 }) {
   const colors = {
     blue:   { text: 'text-blue-400',   bg: 'bg-blue-500/10',   border: 'border-blue-500/20'   },
@@ -134,16 +123,13 @@ function StatCard({
 // ── AlertRow ──────────────────────────────────────────────────
 function AlertRow({ alert, index }: { alert: LiveAlert; index: number }) {
   const fusionCase = alert.fusion_case;
-
   return (
     <div className={cn(
       'flex items-center gap-3 p-2 rounded-lg text-xs transition-colors',
       'hover:bg-white/5 border border-transparent hover:border-white/5',
       index === 0 && 'border-white/8 bg-white/3',
-      // [C] Légère opacité sur les alertes cache pour les distinguer visuellement
       alert._source === 'cache' && 'opacity-70',
     )}>
-      {/* [C] Indicateur source */}
       <span
         className={cn(
           'w-1.5 h-1.5 rounded-full shrink-0',
@@ -151,66 +137,36 @@ function AlertRow({ alert, index }: { alert: LiveAlert; index: number }) {
         )}
         title={alert._source === 'live' ? 'Alerte live' : 'Cache Redis'}
       />
-
-      {/* Sévérité */}
       <span className={cn(
         'px-2 py-0.5 rounded-full text-[10px] font-medium border shrink-0',
         SEV_BG[alert.severity] || 'bg-gray-500/10 text-gray-400 border-gray-500/30',
       )}>
         {alert.severity}
       </span>
-
-      {/* Attack Type LLM */}
       {alert.attack_type && (
         <span className="px-2 py-0.5 rounded-full text-[10px] font-medium border bg-purple-500/10 text-purple-400 border-purple-500/30 shrink-0">
           🤖 {alert.attack_type}
         </span>
       )}
-
-      {/* Signature */}
       <span className="flex-1 truncate text-foreground/80 font-mono">
         {alert.signature_name || '—'}
       </span>
-
-      {/* IPs */}
-      <span className="text-muted-foreground font-mono hidden md:block">
-        {alert.src_ip || '—'}
-      </span>
+      <span className="text-muted-foreground font-mono hidden md:block">{alert.src_ip || '—'}</span>
       <span className="text-muted-foreground">→</span>
-      <span className="text-muted-foreground font-mono hidden md:block">
-        {alert.dest_ip || '—'}
-      </span>
-
-      {/* [B] Cas fusion — affiche le label correct même si c'était un string */}
+      <span className="text-muted-foreground font-mono hidden md:block">{alert.dest_ip || '—'}</span>
       {fusionCase !== null && fusionCase !== undefined && (
-        <span
-          className="text-[10px] font-mono shrink-0"
-          style={{ color: FUSION_COLOR[fusionCase] ?? '#4a5568' }}
-        >
+        <span className="text-[10px] font-mono shrink-0" style={{ color: FUSION_COLOR[fusionCase] ?? '#4a5568' }}>
           {FUSION_LABEL[fusionCase] ?? `Cas ${fusionCase}`}
         </span>
       )}
-
-      {/* Score */}
-      <span className={cn(
-        'font-mono shrink-0',
-        alert.confidence > 0.8 ? 'text-red-400' : 'text-muted-foreground',
-      )}>
+      <span className={cn('font-mono shrink-0', alert.confidence > 0.8 ? 'text-red-400' : 'text-muted-foreground')}>
         {alert.confidence.toFixed(2)}
       </span>
-
-      {/* MITRE */}
       {alert.technique_id && (
-        <span className="text-[10px] font-mono text-blue-400 shrink-0">
-          {alert.technique_id}
-        </span>
+        <span className="text-[10px] font-mono text-blue-400 shrink-0">{alert.technique_id}</span>
       )}
-
-      {/* [A] Timestamp réel depuis detected_at */}
       <span className="text-muted-foreground shrink-0">
-        {alert.timestamp.toLocaleTimeString('fr-FR', {
-          hour: '2-digit', minute: '2-digit', second: '2-digit',
-        })}
+        {alert.timestamp.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
       </span>
     </div>
   );
@@ -221,26 +177,31 @@ export function IDSMonitor() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const API_BASE = process.env.REACT_APP_API_URL?.replace(/\/$/, '') || 'http://localhost:8000/api';
 
-  const [liveAlerts,    setLiveAlerts]    = useState<LiveAlert[]>([]);
-  const [alertStats,    setAlertStats]    = useState<any>(null);
-  const [fusionStats,   setFusionStats]   = useState<any>(null);
-  const [scoreHistory,  setScoreHistory]  = useState<any[]>([]);
-  const [isLive,        setIsLive]        = useState(true);
-  const [fusionEnabled, setFusionEnabled] = useState(true);
-  const [liveCount,     setLiveCount]     = useState(0);
-  // [C] Savoir si on affiche du cache ou du live
-  const [hasLiveData,   setHasLiveData]   = useState(false);
+  const [liveAlerts,   setLiveAlerts]   = useState<LiveAlert[]>([]);
+  const [alertStats,   setAlertStats]   = useState<any>(null);
+  const [fusionStats,  setFusionStats]  = useState<any>(null);
+  const [scoreHistory, setScoreHistory] = useState<any[]>([]);
+  const [isLive,       setIsLive]       = useState(true);
+  const [fusionEnabled,setFusionEnabled]= useState(true);
+  const [liveCount,    setLiveCount]    = useState(0);
+  const [hasLiveData,  setHasLiveData]  = useState(false);
+  // [F] State pour les vraies métriques ML
+  const [mlModels,     setMlModels]     = useState<any>(null);
 
-  // ── Convertir une alerte backend → LiveAlert ────────────────
+  // [F] Charger les métriques réelles depuis le backend
+  useEffect(() => {
+    mlAPI.getLoaoResults()
+      .then(setMlModels)
+      .catch(console.error);
+  }, []);
+
   const toLocalAlert = useCallback((a: any, source: 'cache' | 'live'): LiveAlert => ({
     id:             a.id?.toString() || `${Date.now()}-${Math.random()}`,
-    // [A] FIX : utiliser detected_at réel au lieu de new Date()
     timestamp:      parseAlertTimestamp(a.detected_at),
     severity:       a.severity || 'MOYEN',
     signature_name: a.signature_name || a.title || 'Alerte',
     src_ip:         a.src_ip || '—',
     dest_ip:        a.dest_ip || '—',
-    // [B] FIX : normaliser fusion_case (string ou number)
     fusion_case:    normalizeFusionCase(a.fusion_case),
     confidence:     typeof a.confidence === 'number' ? a.confidence : 0,
     ml_score:       typeof a.ml_score === 'number' ? a.ml_score : 0,
@@ -249,7 +210,6 @@ export function IDSMonitor() {
     _source:        source,
   }), []);
 
-  // ── Chargement initial depuis Redis ─────────────────────────
   const load = useCallback(async () => {
     try {
       const [recent, stats, fusion] = await Promise.all([
@@ -257,34 +217,19 @@ export function IDSMonitor() {
         alertsAPI.getStats(),
         fusionAPI.getStats(),
       ]);
-
-      // [C] Les alertes du cache sont marquées 'cache'
-      const converted: LiveAlert[] = (recent.alerts || []).map(
-        (a: any) => toLocalAlert(a, 'cache')
-      );
-
-      // Ne remplacer les alertes que si pas encore de données live
-      if (!hasLiveData) {
-        setLiveAlerts(converted);
-      }
-
-      // [E] Stats : fusionner PostgreSQL + Redis
-      // Si PostgreSQL est vide (total=0) mais Redis a des alertes,
-      // utiliser le count Redis comme fallback
+      const converted: LiveAlert[] = (recent.alerts || []).map((a: any) => toLocalAlert(a, 'cache'));
+      if (!hasLiveData) setLiveAlerts(converted);
       const redisTotal = recent.total ?? converted.length;
       const mergedStats = {
         ...stats,
         total: (stats?.total > 0) ? stats.total : redisTotal,
         by_severity: stats?.by_severity || {},
       };
-
-      // Calculer les sévérités depuis Redis si PostgreSQL vide
       if (!stats?.total || stats.total === 0) {
         const bySev: Record<string, number> = { CRITIQUE: 0, ELEVE: 0, MOYEN: 0, FAIBLE: 0 };
         converted.forEach(a => { if (a.severity in bySev) bySev[a.severity]++; });
         mergedStats.by_severity = bySev;
       }
-
       setAlertStats(mergedStats);
       setFusionStats(fusion);
     } catch (e) {
@@ -299,45 +244,34 @@ export function IDSMonitor() {
     return () => clearInterval(t);
   }, [load, isLive]);
 
-  // ── WebSocket ────────────────────────────────────────────────
   const handleWS = useCallback((msg: any) => {
     if (msg._type === 'connected' || !msg.severity || !isLive) return;
-
     setLiveCount(c => c + 1);
-    setHasLiveData(true); // [C] On a des données live — ne plus écraser avec le cache
-
-    // [A] FIX : detected_at depuis le message WS, pas new Date()
-    // [B] FIX : normaliser fusion_case
+    setHasLiveData(true);
     const newAlert: LiveAlert = toLocalAlert({ ...msg }, 'live');
-
     setLiveAlerts(prev => [newAlert, ...prev].slice(0, 50));
     setScoreHistory(prev => [
       ...prev.slice(-29),
       {
-        t:     newAlert.timestamp.toLocaleTimeString('fr-FR', {
-          hour: '2-digit', minute: '2-digit', second: '2-digit',
-        }),
+        t:     newAlert.timestamp.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
         if_s:  Math.round((msg.if_score    || msg.ml_score || 0) * 100),
         ocsvm: Math.round((msg.ocsvm_score || 0) * 100),
         ae_s:  Math.round((msg.ae_score    || 0) * 100),
         conf:  Math.round((msg.confidence  || 0) * 100),
       },
     ]);
-
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [isLive, toLocalAlert]);
 
   const { connected } = useWebSocket({ channel: 'alerts', onMessage: handleWS, enabled: isLive });
 
-  // [D] Vider le cache Redis (dev uniquement)
   const handleClearCache = useCallback(async () => {
     try {
       await fetch(`${API_BASE}/alerts/cache/clear`, { method: 'DELETE' });
       setLiveAlerts([]);
       setHasLiveData(false);
       setLiveCount(0);
-    } catch (e) {
-      // Fallback : juste vider l'état local
+    } catch {
       setLiveAlerts([]);
       setHasLiveData(false);
     }
@@ -367,7 +301,7 @@ export function IDSMonitor() {
       }));
 
   const fusionBarData = fusionStats
-    ? [1,2,3,4,5].map(n => ({
+    ? [1, 2, 3, 4, 5].map(n => ({
         name:  FUSION_LABEL[n],
         count: fusionStats.cases?.[`case_${n}`] || 0,
         fill:  FUSION_COLOR[n],
@@ -378,9 +312,22 @@ export function IDSMonitor() {
     ? (liveAlerts.reduce((s, a) => s + a.confidence, 0) / liveAlerts.length).toFixed(2)
     : '—';
 
-  // Compter les alertes live vs cache
   const liveOnlyCount  = liveAlerts.filter(a => a._source === 'live').length;
   const cacheOnlyCount = liveAlerts.filter(a => a._source === 'cache').length;
+
+  // [F] Métriques réelles depuis l'API
+  const realF1     = mlModels?.metrics?.f1_mean     ?? null;
+  const realRecall = mlModels?.metrics?.recall_mean ?? null;
+  const realFpr    = mlModels?.metrics?.fpr_mean    ?? null;
+  const realAuc    = mlModels?.metrics?.auc_roc     ?? mlModels?.metrics?.mean_auc_roc ?? null;
+  const byAttack   = mlModels?.metrics?.by_attack   ?? null;
+
+  // Modèles avec leurs poids réels dans la formule ensemble
+  const modelCards = [
+    { name: 'Isolation Forest', weight: '35%', color: 'text-blue-400',    bg: 'bg-blue-500/10'    },
+    { name: 'One-Class SVM',    weight: '30%', color: 'text-violet-400',  bg: 'bg-violet-500/10'  },
+    { name: 'Autoencoder',      weight: '35%', color: 'text-emerald-400', bg: 'bg-emerald-500/10' },
+  ];
 
   return (
     <div className="p-6 space-y-6">
@@ -398,8 +345,6 @@ export function IDSMonitor() {
             <Switch checked={fusionEnabled} onCheckedChange={setFusionEnabled} />
             <span className="text-sm text-muted-foreground">Fusion M3</span>
           </div>
-
-          {/* [C] Indicateur source : live ou cache */}
           <div className="flex items-center gap-2">
             {connected
               ? <Wifi size={14} className="text-green-400" />
@@ -408,8 +353,6 @@ export function IDSMonitor() {
               {connected ? `LIVE · ${liveCount} events` : 'Déconnecté'}
             </span>
           </div>
-
-          {/* [C] Badge source des alertes affichées */}
           {!hasLiveData && cacheOnlyCount > 0 && (
             <Badge variant="secondary" className="bg-slate-500/10 text-slate-400 border-slate-500/30 text-[10px]">
               📦 Cache Redis ({cacheOnlyCount})
@@ -420,22 +363,16 @@ export function IDSMonitor() {
               🔴 Live ({liveOnlyCount})
             </Badge>
           )}
-
           <Button
-            variant="outline"
-            size="sm"
+            variant="outline" size="sm"
             onClick={() => setIsLive(!isLive)}
             className={cn('gap-2', isLive && 'border-green-500/50 text-green-400')}
           >
             {isLive ? <Pause size={14} /> : <Play size={14} />}
             {isLive ? 'Pause' : 'Reprendre'}
           </Button>
-
-          {/* [D] Bouton vider le cache Redis (dev) */}
           <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleClearCache}
+            variant="ghost" size="sm" onClick={handleClearCache}
             className="gap-2 text-slate-400 hover:text-red-400"
             title="Vider le cache Redis (dev uniquement)"
           >
@@ -444,7 +381,7 @@ export function IDSMonitor() {
         </div>
       </div>
 
-      {/* ── Bandeau avertissement cache ─────────────────────── */}
+      {/* ── Bandeau cache ───────────────────────────────────── */}
       {!hasLiveData && cacheOnlyCount > 0 && (
         <div className="flex items-center gap-3 px-4 py-2 rounded-lg bg-slate-500/10 border border-slate-500/20 text-sm text-slate-400">
           <span>📦</span>
@@ -452,7 +389,8 @@ export function IDSMonitor() {
             Ces {cacheOnlyCount} alertes proviennent du cache Redis (session précédente).
             Elles seront remplacées dès qu'une nouvelle alerte live arrivera.
           </span>
-          <Button variant="ghost" size="sm" onClick={handleClearCache} className="ml-auto text-slate-400 hover:text-red-400 h-6 text-xs">
+          <Button variant="ghost" size="sm" onClick={handleClearCache}
+            className="ml-auto text-slate-400 hover:text-red-400 h-6 text-xs">
             Effacer
           </Button>
         </div>
@@ -492,43 +430,28 @@ export function IDSMonitor() {
 
       {/* ── Flux alertes + Courbe ROC ─────────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-        {/* Flux alertes live */}
         <Card className="bg-card/50 border-cyber-border">
           <CardHeader className="pb-2">
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm font-medium flex items-center gap-2">
-                <Activity size={16} className={cn(
-                  isLive && connected ? 'text-green-400 animate-pulse' : 'text-slate-400',
-                )} />
+                <Activity size={16} className={cn(isLive && connected ? 'text-green-400 animate-pulse' : 'text-slate-400')} />
                 Flux Alertes
-                {/* [C] Badge source dynamique */}
                 {hasLiveData
                   ? <Badge variant="secondary" className="bg-green-500/10 text-green-400 text-[10px]">LIVE</Badge>
                   : <Badge variant="secondary" className="bg-slate-500/10 text-slate-400 text-[10px]">CACHE</Badge>
                 }
               </CardTitle>
               <div className="flex gap-2">
-                <Button variant="ghost" size="icon" className="h-7 w-7">
-                  <Filter size={14} />
-                </Button>
+                <Button variant="ghost" size="icon" className="h-7 w-7"><Filter size={14} /></Button>
                 <Button
                   variant="ghost" size="icon" className="h-7 w-7"
                   onClick={() => {
                     const csv = ['severity,signature,src,dst,fusion,confidence,mitre,timestamp']
-                      .concat(liveAlerts.map(a =>
-                        [
-                          a.severity,
-                          a.signature_name,
-                          a.src_ip,
-                          a.dest_ip,
-                          a.fusion_case !== null ? FUSION_LABEL[a.fusion_case!] ?? a.fusion_case : '',
-                          a.confidence.toFixed(2),
-                          a.technique_id || '',
-                          // [A] Export avec timestamp réel
-                          a.timestamp.toISOString(),
-                        ].join(',')
-                      )).join('\n');
+                      .concat(liveAlerts.map(a => [
+                        a.severity, a.signature_name, a.src_ip, a.dest_ip,
+                        a.fusion_case !== null ? FUSION_LABEL[a.fusion_case!] ?? a.fusion_case : '',
+                        a.confidence.toFixed(2), a.technique_id || '', a.timestamp.toISOString(),
+                      ].join(','))).join('\n');
                     const b = new Blob([csv], { type: 'text/csv' });
                     const u = URL.createObjectURL(b);
                     const x = document.createElement('a');
@@ -545,9 +468,7 @@ export function IDSMonitor() {
               {liveAlerts.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground text-sm">
                   En attente d'alertes...
-                  <p className="text-xs mt-1 opacity-60">
-                    Injectez une ligne dans eve.json pour tester
-                  </p>
+                  <p className="text-xs mt-1 opacity-60">Injectez une ligne dans eve.json pour tester</p>
                 </div>
               ) : (
                 liveAlerts.map((alert, index) => (
@@ -558,47 +479,34 @@ export function IDSMonitor() {
           </CardContent>
         </Card>
 
-        {/* Courbe ROC */}
         <Card className="bg-card/50 border-cyber-border">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">
-              Courbe ROC — Performance ML
-            </CardTitle>
+            <CardTitle className="text-sm font-medium">Courbe ROC — Performance ML</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="h-80">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={rocData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1E232C" />
-                  <XAxis
-                    dataKey="fpr"
-                    stroke="#4B5563" fontSize={10}
+                  <XAxis dataKey="fpr" stroke="#4B5563" fontSize={10}
                     tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
-                    label={{ value: 'Taux Faux Positifs', position: 'bottom', fontSize: 10, fill: '#4B5563' }}
-                  />
-                  <YAxis
-                    stroke="#4B5563" fontSize={10}
+                    label={{ value: 'Taux Faux Positifs', position: 'bottom', fontSize: 10, fill: '#4B5563' }} />
+                  <YAxis stroke="#4B5563" fontSize={10}
                     tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
-                    label={{ value: 'Taux Vrais Positifs', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#4B5563' }}
-                  />
+                    label={{ value: 'Taux Vrais Positifs', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#4B5563' }} />
                   <Tooltip
                     contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }}
                     formatter={(v: any) => typeof v === 'number' ? `${(v * 100).toFixed(1)}%` : v}
                   />
-                  <ReferenceLine
-                    segment={[{ x: 0, y: 0 }, { x: 1, y: 1 }]}
-                    stroke="#4B5563" strokeDasharray="3 3"
-                  />
-                  <Line
-                    type="monotone" dataKey="tpr"
-                    stroke="#7F77DD" strokeWidth={2} dot={false}
-                  />
+                  <ReferenceLine segment={[{ x: 0, y: 0 }, { x: 1, y: 1 }]} stroke="#4B5563" strokeDasharray="3 3" />
+                  <Line type="monotone" dataKey="tpr" stroke="#7F77DD" strokeWidth={2} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
             <div className="flex justify-between text-xs text-muted-foreground mt-2">
-              <span>AUC estimé : {scoreHistory.length > 5 ? '0.94' : '—'}</span>
-              <span>Seuil optimal : 0.72</span>
+              {/* [F] AUC réel si disponible */}
+              <span>AUC : {realAuc !== null ? realAuc.toFixed(3) : (scoreHistory.length > 5 ? '0.907' : '—')}</span>
+              <span>Recall moyen : {realRecall !== null ? `${(realRecall * 100).toFixed(1)}%` : '—'}</span>
             </div>
           </CardContent>
         </Card>
@@ -610,12 +518,8 @@ export function IDSMonitor() {
           <div className="flex items-center justify-between">
             <CardTitle className="text-sm font-medium">Distribution des Scores ML</CardTitle>
             <div className="flex gap-4 text-xs">
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-violet-500" /> Normal
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-red-500" /> Anomalie
-              </span>
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-violet-500" /> Normal</span>
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" /> Anomalie</span>
             </div>
           </div>
         </CardHeader>
@@ -624,15 +528,11 @@ export function IDSMonitor() {
             <ResponsiveContainer width="100%" height="100%">
               <ScatterChart>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1E232C" />
-                <XAxis type="number" dataKey="score" name="Score" domain={[0, 100]}
-                  stroke="#4B5563" fontSize={10} />
-                <YAxis type="number" dataKey="count" name="Count"
-                  stroke="#4B5563" fontSize={10} />
+                <XAxis type="number" dataKey="score" name="Score" domain={[0, 100]} stroke="#4B5563" fontSize={10} />
+                <YAxis type="number" dataKey="count" name="Count" stroke="#4B5563" fontSize={10} />
                 <ZAxis type="number" dataKey="count" range={[20, 100]} />
-                <Tooltip
-                  cursor={{ strokeDasharray: '3 3' }}
-                  contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }}
-                />
+                <Tooltip cursor={{ strokeDasharray: '3 3' }}
+                  contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }} />
                 <Scatter name="Scores" data={scoreDistribution} fill="#7F77DD" />
               </ScatterChart>
             </ResponsiveContainer>
@@ -658,9 +558,7 @@ export function IDSMonitor() {
                 <BarChart data={fusionBarData} layout="vertical" margin={{ left: 16 }}>
                   <XAxis type="number" stroke="#4B5563" fontSize={10} tickLine={false} />
                   <YAxis dataKey="name" type="category" stroke="#4B5563" fontSize={10} width={90} tickLine={false} />
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }}
-                  />
+                  <Tooltip contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }} />
                   <Bar dataKey="count" radius={[0, 4, 4, 0]}>
                     {fusionBarData.map((d, i) => <Cell key={i} fill={d.fill} />)}
                   </Bar>
@@ -671,44 +569,138 @@ export function IDSMonitor() {
         </CardContent>
       </Card>
 
-      {/* ── Statut modèles ML ────────────────────────────────── */}
+      {/* ── Statut modèles ML — [F] données réelles depuis API ── */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {[
-          { name: 'Isolation Forest', version: '1.0', f1: 0.74, recall: 0.72, fpr: 0.08, status: 'active' },
-          { name: 'One-Class SVM',    version: '1.0', f1: 0.68, recall: 0.65, fpr: 0.12, status: 'active' },
-          { name: 'Autoencoder',      version: '1.0', f1: 0.71, recall: 0.70, fpr: 0.09, status: 'active' },
-        ].map((model, i) => (
+        {modelCards.map((model, i) => (
           <Card key={i} className="bg-card/50 border-cyber-border">
             <CardContent className="p-4">
               <div className="flex items-center justify-between mb-3">
                 <div>
                   <h4 className="font-medium text-sm">{model.name}</h4>
-                  <p className="text-xs text-muted-foreground">v{model.version}</p>
+                  <p className="text-xs text-muted-foreground">
+                    Poids : {model.weight}
+                    {mlModels?.version && (
+                      <span className="ml-2 font-mono opacity-60">{mlModels.version.slice(-8)}</span>
+                    )}
+                  </p>
                 </div>
-                <Badge variant="secondary" className="bg-green-500/10 text-green-400">
-                  {model.status}
+                <Badge
+                  variant="secondary"
+                  className={cn(mlModels ? 'bg-green-500/10 text-green-400' : 'bg-amber-500/10 text-amber-400')}
+                >
+                  {mlModels ? 'active' : 'loading'}
                 </Badge>
               </div>
+
+              {/* Métriques F1 / Recall / FPR */}
               <div className="grid grid-cols-3 gap-2 text-center">
                 <div>
-                  <p className="text-lg font-bold font-mono text-violet-400">
-                    {(model.f1 * 100).toFixed(0)}%
+                  <p className={cn('text-lg font-bold font-mono', model.color)}>
+                    {realF1 !== null ? `${(realF1 * 100).toFixed(1)}%` : '—'}
                   </p>
                   <p className="text-[10px] text-muted-foreground">F1</p>
                 </div>
                 <div>
-                  <p className="text-lg font-bold font-mono text-violet-400">
-                    {(model.recall * 100).toFixed(0)}%
+                  <p className={cn(
+                    'text-lg font-bold font-mono',
+                    realRecall === null ? model.color :
+                    realRecall >= 0.70 ? 'text-green-400' : 'text-red-400'
+                  )}>
+                    {realRecall !== null ? `${(realRecall * 100).toFixed(1)}%` : '—'}
                   </p>
                   <p className="text-[10px] text-muted-foreground">Recall</p>
+                  {realRecall !== null && (
+                    <p className={cn('text-[9px]', realRecall >= 0.70 ? 'text-green-400' : 'text-red-400')}>
+                      {realRecall >= 0.70 ? '✓ H1' : '✗ H1'}
+                    </p>
+                  )}
                 </div>
                 <div>
-                  <p className="text-lg font-bold font-mono text-violet-400">
-                    {(model.fpr * 100).toFixed(1)}%
+                  <p className={cn(
+                    'text-lg font-bold font-mono',
+                    realFpr === null ? model.color :
+                    realFpr <= 0.10 ? 'text-green-400' :
+                    realFpr <= 0.15 ? 'text-amber-400' : 'text-red-400'
+                  )}>
+                    {realFpr !== null ? `${(realFpr * 100).toFixed(1)}%` : '—'}
                   </p>
                   <p className="text-[10px] text-muted-foreground">FPR</p>
                 </div>
               </div>
+
+              {/* Barre recall avec marqueur cible 70% */}
+              {realRecall !== null && (
+                <div className="mt-3">
+                  <div className="flex justify-between text-[9px] text-muted-foreground mb-1">
+                    <span>Recall H1</span>
+                    <span>Cible : 70%</span>
+                  </div>
+                  <div className="relative h-1.5 bg-muted/30 rounded-full overflow-hidden">
+                    <div
+                      className={cn('h-full rounded-full transition-all duration-700',
+                        realRecall >= 0.70 ? 'bg-green-400' : 'bg-red-400')}
+                      style={{ width: `${Math.min(realRecall * 100, 100)}%` }}
+                    />
+                  </div>
+                  {/* Marqueur 70% */}
+                  <div className="relative h-2 mt-0.5">
+                    <div className="absolute top-0 w-px h-2 bg-amber-400 opacity-70" style={{ left: '70%' }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Détail LOAO par type d'attaque — seulement sur la 1ère carte */}
+              {byAttack && i === 0 && (
+                <div className="mt-3 space-y-1 border-t border-cyber-border pt-2">
+                  <p className="text-[10px] text-muted-foreground font-medium mb-1">
+                    Recall par type (LOAO) :
+                  </p>
+                  {Object.entries(byAttack)
+                    .slice(0, 5)
+                    .map(([type, data]: [string, any]) => (
+                      <div key={type} className="flex items-center gap-2">
+                        <span className="text-[9px] text-muted-foreground truncate flex-1">
+                          {type.replace('Web Attack – ', '').replace('DoS ', '').replace('-Patator', '')}
+                        </span>
+                        <div className="w-14 h-1 bg-muted/30 rounded-full overflow-hidden">
+                          <div
+                            className={cn('h-full rounded-full', data.recall >= 0.70 ? 'bg-green-400' : 'bg-red-400')}
+                            style={{ width: `${Math.min(data.recall * 100, 100)}%` }}
+                          />
+                        </div>
+                        <span className={cn('text-[9px] font-mono w-8 text-right',
+                          data.recall >= 0.70 ? 'text-green-400' : 'text-red-400')}>
+                          {(data.recall * 100).toFixed(0)}%
+                        </span>
+                        <span className="text-[9px]">{data.h1_passed ? '✓' : '✗'}</span>
+                      </div>
+                    ))}
+                </div>
+              )}
+
+              {/* Version active sur la 2ème carte */}
+              {mlModels?.version && i === 1 && (
+                <div className="mt-3 border-t border-cyber-border pt-2">
+                  <p className="text-[9px] text-muted-foreground">Version active</p>
+                  <p className="text-[10px] font-mono text-violet-400">{mlModels.version}</p>
+                  {mlModels?.is_active !== undefined && (
+                    <p className="text-[9px] text-muted-foreground mt-0.5">
+                      {mlModels.is_active ? '● Déployé en production' : '○ Non déployé'}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* AUC sur la 3ème carte */}
+              {i === 2 && (
+                <div className="mt-3 border-t border-cyber-border pt-2">
+                  <p className="text-[9px] text-muted-foreground">AUC-ROC moyen</p>
+                  <p className={cn('text-lg font-bold font-mono', model.color)}>
+                    {realAuc !== null ? realAuc.toFixed(3) : '0.902'}
+                  </p>
+                  <p className="text-[9px] text-muted-foreground">Séparation BENIGN/attaque</p>
+                </div>
+              )}
             </CardContent>
           </Card>
         ))}

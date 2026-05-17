@@ -7,6 +7,7 @@ import { NavLink, useLocation } from "react-router-dom";
 const NAV = [
   { to: "/",           label: "Overview",      icon: "◈", tag: "M9"  },
   { to: "/ids",        label: "IDS Monitor",   icon: "◉", tag: "M1/M3" },
+  {to : "/scan-code",   label: "Code Scan",     icon: "▣", tag: "M4/M5" },
   { to: "/incidents",  label: "Incidents",     icon: "⚑", tag: "M7"  },
   { to: "/mitre",      label: "MITRE Matrix",  icon: "⊞", tag: "M6"  },
   { to: "/ml",         label: "ML Models",     icon: "◌", tag: "M2"  },

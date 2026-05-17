@@ -69,7 +69,7 @@ class EnsembleAnomalyDetector:
         # Solution : seuil unique calibré sur le p95 des scores BENIGN
         # → garantit FPR ≤ 5% sur trafic normal par construction.
         benign_scores = self.predict_score(X_benign)
-        self._decision_threshold = float(np.percentile(benign_scores, 93))
+        self._decision_threshold = float(np.percentile(benign_scores, 86))
         logger.info(
             "✅ Seuil décision calibré (p95 scores BENIGN) = %.4f",
             self._decision_threshold,

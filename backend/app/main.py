@@ -21,7 +21,8 @@ from app.api import websocket as ws_router
 from app.services.suricata_service import SuricataEveWatcher
 from app.services.incident_consumer import IncidentConsumer
 from app.services.redis_ws_bridge import redis_ws_bridge
-
+from app.api.reports import router as reports_router
+from app.api.vulnerability_llm import router as vulnerability_llm_router
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cybersentinel")
 
@@ -140,7 +141,8 @@ app.include_router(scoring.router, prefix="/api/scoring", tags=["M7 — Scoring"
 app.include_router(sast.router, prefix="/api/sast", tags=["M4 — SAST"])
 app.include_router(dast.router, prefix="/api/dast", tags=["M5 — DAST"])
 app.include_router(cicd.router, prefix="/api/cicd", tags=["M8 — CI/CD"])
-
+app.include_router(reports_router, prefix="/api/reports", tags=["M11 — Rapports"])
+app.include_router(vulnerability_llm_router, prefix="/api", tags=["M12 — LLM Vulnerabilities"])
 # ============================================================
 # Routers WebSocket
 # ============================================================

@@ -3,16 +3,19 @@ import { useNavigate, useLocation } from "react-router-dom";
 import {
   Shield, Zap, Code2, ArrowLeft, ArrowRight,
   CheckCircle2, XCircle, AlertTriangle, Loader2, ExternalLink,
+  Container,
+  BrainCircuit,
+  X,
 } from "lucide-react";
 import { cn } from "../lib/utils";
-import { sastAPI, dastAPI, cicdAPI } from "../services/api";
+import { sastAPI, dastAPI, cicdAPI, vulnerabilityLLMAPI } from "../services/api";
 
 interface ScanState {
   sastOn: boolean;
   dastOn: boolean;
   cicdOn: boolean;
   projectName: string;
-  sourceMode: string;
+  sourceMode: string;   // "zip" | "git" | "image"
   dastTarget: string;
   dastResult?: any;
   sastScanId?: string | null;
@@ -25,24 +28,33 @@ function safeStr(v: any): string {
   return JSON.stringify(v);
 }
 
-function globalRisk(sastData: any, dastData: any, cicdData: any) {
+function globalRisk(sastData: any, dastData: any, cicdData: any, sourceMode: string) {
   const b = sastData?.by_severity || {};
   const critical = b.CRITICAL || 0;
-  const high = b.HIGH || 0;
-  const medium = b.MEDIUM || 0;
+  const high     = b.HIGH     || 0;
+  const medium   = b.MEDIUM   || 0;
 
   const dastVulns = Number(dastData?.total_vulns ?? dastData?.total_proofs ?? 0);
-  const blocked = cicdData?.blocked || 0;
+  const blocked   = cicdData?.blocked || 0;
+
+  // En mode image, intégrer les findings Trivy dans le score
+  const trivyResults  = dastData?.docker_image_scan?.trivy_summary || [];
+  const trivyCritical = trivyResults.filter((r: any) =>
+    r.Vulnerabilities?.some((v: any) => v.Severity === "CRITICAL")
+  ).length;
 
   const raw = Math.min(
-    critical * 10 + high * 3 + medium + dastVulns * 5 + blocked * 8,
+    critical * 10 + high * 3 + medium +
+    dastVulns * 5 + blocked * 8 +
+    trivyCritical * 10,
     100
   );
 
-  if (critical > 0 || raw >= 80) return { score: raw, level: "critical" as const, label: "Critique" };
-  if (raw >= 50) return { score: raw, level: "high" as const, label: "Élevé" };
-  if (raw >= 20) return { score: raw, level: "medium" as const, label: "Moyen" };
-  return { score: raw, level: "low" as const, label: "Faible" };
+  if (critical > 0 || trivyCritical > 0 || raw >= 80)
+    return { score: raw, level: "critical" as const, label: "Critique" };
+  if (raw >= 50) return { score: raw, level: "high"     as const, label: "Élevé" };
+  if (raw >= 20) return { score: raw, level: "medium"   as const, label: "Moyen" };
+  return          { score: raw, level: "low"      as const, label: "Faible" };
 }
 
 function SevCount({ count, label, color }: { count: number; label: string; color: string }) {
@@ -54,16 +66,14 @@ function SevCount({ count, label, color }: { count: number; label: string; color
   );
 }
 
+// ── Carte SAST (M4) ──────────────────────────────────────────
 function SastCard({
-  data, loading, scanId, onDetail,
+  data, loading, scanId, onDetail, onExplainTop,
 }: {
-  data: any;
-  loading: boolean;
-  scanId: string | null;
-  onDetail: () => void;
+  data: any; loading: boolean; scanId: string | null; onDetail: () => void; onExplainTop: () => void;
 }) {
-  const bySev = data?.by_severity || {};
-  const total = data?.total || 0;
+  const bySev    = data?.by_severity || {};
+  const total    = data?.total || 0;
   const findings = data?.top_findings || [];
 
   return (
@@ -74,15 +84,14 @@ function SastCard({
           <span className="text-sm font-medium text-blue-400">Scan statique</span>
           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/20">M4</span>
         </div>
-
         {loading ? (
           <Loader2 size={14} className="animate-spin text-muted-foreground" />
         ) : (
           <span className={cn(
             "text-xs px-2 py-0.5 rounded-full border font-medium",
-            total === 0 ? "bg-green-500/10 text-green-400 border-green-500/20" :
-            bySev.CRITICAL > 0 ? "bg-red-500/10 text-red-400 border-red-500/20" :
-            "bg-amber-500/10 text-amber-400 border-amber-500/20"
+            total === 0         ? "bg-green-500/10 text-green-400 border-green-500/20" :
+            bySev.CRITICAL > 0  ? "bg-red-500/10   text-red-400   border-red-500/20"   :
+                                  "bg-amber-500/10 text-amber-400 border-amber-500/20"
           )}>
             {total === 0 ? "Aucun finding" : `${total} findings`}
           </span>
@@ -97,9 +106,9 @@ function SastCard({
         <>
           <div className="grid grid-cols-4 gap-2 py-3 border-y border-blue-500/10">
             <SevCount count={bySev.CRITICAL || 0} label="Critique" color="text-red-400" />
-            <SevCount count={bySev.HIGH || 0} label="Élevé" color="text-amber-400" />
-            <SevCount count={bySev.MEDIUM || 0} label="Moyen" color="text-blue-400" />
-            <SevCount count={bySev.LOW || 0} label="Faible" color="text-green-400" />
+            <SevCount count={bySev.HIGH     || 0} label="Élevé"    color="text-amber-400" />
+            <SevCount count={bySev.MEDIUM   || 0} label="Moyen"    color="text-blue-400" />
+            <SevCount count={bySev.LOW      || 0} label="Faible"   color="text-green-400" />
           </div>
 
           {findings.length > 0 && (
@@ -109,16 +118,13 @@ function SastCard({
                 <div key={i} className="flex items-center gap-2 text-xs">
                   <span className={cn("w-1.5 h-1.5 rounded-full shrink-0",
                     f.severity === "CRITICAL" ? "bg-red-400" :
-                    f.severity === "HIGH" ? "bg-amber-400" :
-                    "bg-blue-400"
+                    f.severity === "HIGH"     ? "bg-amber-400" : "bg-blue-400"
                   )} />
                   <span className="text-muted-foreground truncate">
                     {f.message || f.title || "Finding"}
                   </span>
                   {f.tool && (
-                    <span className="ml-auto text-[10px] text-muted-foreground/60 shrink-0">
-                      {f.tool}
-                    </span>
+                    <span className="ml-auto text-[10px] text-muted-foreground/60 shrink-0">{f.tool}</span>
                   )}
                 </div>
               ))}
@@ -131,22 +137,151 @@ function SastCard({
         <p className="text-xs text-muted-foreground">Aucune donnée disponible</p>
       )}
 
-      <button
-        onClick={onDetail}
-        className="mt-auto flex items-center gap-1.5 text-xs text-blue-400 hover:text-blue-300 transition-colors"
-      >
-        Voir tous les findings <ArrowRight size={12} />
-      </button>
+      <div className="mt-auto flex items-center gap-3">
+        <button onClick={onDetail}
+          className="flex items-center gap-1.5 text-xs text-blue-400 hover:text-blue-300 transition-colors">
+          Voir tous les findings <ArrowRight size={12} />
+        </button>
+        {findings.length > 0 && (
+          <button onClick={onExplainTop}
+            className="ml-auto flex items-center gap-1.5 text-xs text-purple-300 hover:text-purple-200 transition-colors">
+            <BrainCircuit size={12} /> Expliquer
+          </button>
+        )}
+      </div>
     </div>
   );
 }
 
-function DastCard({ data, loading, onDetail }: { data: any; loading: boolean; onDetail: () => void }) {
-  const totalVulns = Number(data?.total_vulns ?? data?.total_proofs ?? 0);
-  const phases = data?.phases || {};
-  const phaseKeys = Object.keys(phases);
+// ── Carte Image Docker (mode image) ──────────────────────────
+function DockerImageCard({ data, loading, onDetail, onExplainTop }: {
+  data: any; loading: boolean; onDetail: () => void; onExplainTop: () => void;
+}) {
+  const imageInfo    = data?.docker_image_scan || {};
+  const trivyResults = imageInfo?.trivy_summary || [];
+  const totalVulns   = Number(data?.total_vulns ?? data?.total_proofs ?? 0);
+  const phases       = data?.phases || {};
+  const phaseKeys    = Object.keys(phases);
   const passedPhases = phaseKeys.filter(k => phases[k]?.success === true).length;
-  const isActive = data?.active || data?.running || false;
+
+  // Compter les vulnérabilités Trivy
+  let trivyCritical = 0, trivyHigh = 0;
+  trivyResults.forEach((r: any) => {
+    (r.Vulnerabilities || []).forEach((v: any) => {
+      if (v.Severity === "CRITICAL") trivyCritical++;
+      else if (v.Severity === "HIGH") trivyHigh++;
+    });
+  });
+
+  return (
+    <div className="rounded-xl border border-violet-500/20 bg-violet-500/5 p-5 flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Container size={16} className="text-violet-400" />
+          <span className="text-sm font-medium text-violet-400">Scan image Docker</span>
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-400 border border-violet-500/20">M5</span>
+        </div>
+        {loading ? (
+          <Loader2 size={14} className="animate-spin text-muted-foreground" />
+        ) : (
+          <span className={cn(
+            "text-xs px-2 py-0.5 rounded-full border font-medium",
+            data?.error          ? "bg-red-500/10    text-red-400    border-red-500/20"    :
+            trivyCritical > 0    ? "bg-red-500/10    text-red-400    border-red-500/20"    :
+            totalVulns === 0     ? "bg-green-500/10  text-green-400  border-green-500/20"  :
+                                   "bg-violet-500/10 text-violet-400 border-violet-500/20"
+          )}>
+            {data?.error ? "Erreur" : trivyCritical > 0
+              ? `${trivyCritical} critiques`
+              : `${totalVulns} vulnérabilités`}
+          </span>
+        )}
+      </div>
+
+      {/* Nom de l'image */}
+      {imageInfo.image_name && (
+        <p className="text-[10px] font-mono text-muted-foreground/50 -mt-2 truncate">
+          🐳 {imageInfo.image_name}
+        </p>
+      )}
+
+      {!loading && data && !data.error && (
+        <>
+          {/* Score Trivy */}
+          {(trivyCritical > 0 || trivyHigh > 0) && (
+            <div className="grid grid-cols-2 gap-2 py-3 border-y border-violet-500/10">
+              <SevCount count={trivyCritical} label="Trivy Critical" color="text-red-400" />
+              <SevCount count={trivyHigh}     label="Trivy High"     color="text-amber-400" />
+            </div>
+          )}
+
+          {/* Phases ZAP */}
+          {phaseKeys.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wide">Phases ZAP</p>
+                <span className="text-[10px] text-muted-foreground">{passedPhases}/{phaseKeys.length} OK</span>
+              </div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {phaseKeys.slice(0, 6).map((k) => {
+                  const ok = phases[k]?.success === true;
+                  return (
+                    <div key={k} className={cn(
+                      "flex items-center gap-1 text-[10px] px-2 py-1 rounded",
+                      ok ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"
+                    )}>
+                      {ok ? <CheckCircle2 size={10} /> : <XCircle size={10} />}
+                      <span className="truncate">{k.replace(/^\d_/, "").replace(/_/g, " ")}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ZAP findings */}
+          {totalVulns > 0 && (
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-muted-foreground">Vulnérabilités ZAP</span>
+              <span className="font-mono text-red-400">{totalVulns}</span>
+            </div>
+          )}
+        </>
+      )}
+
+      {!loading && data?.error && (
+        <p className="text-xs text-red-400">{safeStr(data.error).slice(0, 120)}</p>
+      )}
+
+      {!loading && !data && (
+        <p className="text-xs text-muted-foreground">Aucune donnée disponible</p>
+      )}
+
+      <div className="mt-auto flex items-center gap-3">
+        <button onClick={onDetail}
+          className="flex items-center gap-1.5 text-xs text-violet-400 hover:text-violet-300 transition-colors">
+          Voir les preuves DAST <ArrowRight size={12} />
+        </button>
+        {totalVulns > 0 && (
+          <button onClick={onExplainTop}
+            className="ml-auto flex items-center gap-1.5 text-xs text-purple-300 hover:text-purple-200 transition-colors">
+            <BrainCircuit size={12} /> Expliquer
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Carte DAST classique (M5) ─────────────────────────────────
+function DastCard({ data, loading, onDetail, onExplainTop }: {
+  data: any; loading: boolean; onDetail: () => void; onExplainTop: () => void;
+}) {
+  const totalVulns   = Number(data?.total_vulns ?? data?.total_proofs ?? 0);
+  const phases       = data?.phases || {};
+  const phaseKeys    = Object.keys(phases);
+  const passedPhases = phaseKeys.filter(k => phases[k]?.success === true).length;
+  const isActive     = data?.active || data?.running || false;
 
   return (
     <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-5 flex flex-col gap-4">
@@ -156,15 +291,14 @@ function DastCard({ data, loading, onDetail }: { data: any; loading: boolean; on
           <span className="text-sm font-medium text-red-400">Scan dynamique</span>
           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/20">M5</span>
         </div>
-
         {loading ? (
           <Loader2 size={14} className="animate-spin text-muted-foreground" />
         ) : (
           <span className={cn(
             "text-xs px-2 py-0.5 rounded-full border font-medium",
-            data?.error ? "bg-red-500/10 text-red-400 border-red-500/20" :
+            data?.error      ? "bg-red-500/10   text-red-400   border-red-500/20"   :
             totalVulns === 0 ? "bg-green-500/10 text-green-400 border-green-500/20" :
-            "bg-red-500/10 text-red-400 border-red-500/20"
+                               "bg-red-500/10   text-red-400   border-red-500/20"
           )}>
             {data?.error ? "Erreur" : totalVulns === 0 ? "Aucune vulnérabilité" : `${totalVulns} vulnérabilités`}
           </span>
@@ -179,7 +313,6 @@ function DastCard({ data, loading, onDetail }: { data: any; loading: boolean; on
                 <p className="text-[10px] text-muted-foreground uppercase tracking-wide">Phases d'exécution</p>
                 <span className="text-[10px] text-muted-foreground">{passedPhases}/{phaseKeys.length} OK</span>
               </div>
-
               <div className="grid grid-cols-3 gap-1.5">
                 {phaseKeys.slice(0, 6).map((k) => {
                   const ok = phases[k]?.success === true;
@@ -201,11 +334,8 @@ function DastCard({ data, loading, onDetail }: { data: any; loading: boolean; on
             <div className="py-2">
               <div className="flex items-center gap-2 text-xs">
                 <span className={cn("w-2 h-2 rounded-full", isActive ? "bg-red-400" : "bg-green-400")} />
-                <span className="text-muted-foreground">
-                  Session {isActive ? "en cours" : "terminée"}
-                </span>
+                <span className="text-muted-foreground">Session {isActive ? "en cours" : "terminée"}</span>
               </div>
-
               {data.total_pcaps !== undefined && (
                 <div className="flex items-center justify-between mt-2 text-xs text-muted-foreground">
                   <span>Fichiers PCAP</span>
@@ -227,26 +357,34 @@ function DastCard({ data, loading, onDetail }: { data: any; loading: boolean; on
       {!loading && data?.error && (
         <p className="text-xs text-red-400">{safeStr(data.error).slice(0, 120)}</p>
       )}
-
       {!loading && !data && (
         <p className="text-xs text-muted-foreground">Aucune donnée disponible</p>
       )}
 
-      <button
-        onClick={onDetail}
-        className="mt-auto flex items-center gap-1.5 text-xs text-red-400 hover:text-red-300 transition-colors"
-      >
-        Voir les preuves DAST <ArrowRight size={12} />
-      </button>
+      <div className="mt-auto flex items-center gap-3">
+        <button onClick={onDetail}
+          className="flex items-center gap-1.5 text-xs text-red-400 hover:text-red-300 transition-colors">
+          Voir les preuves DAST <ArrowRight size={12} />
+        </button>
+        {totalVulns > 0 && (
+          <button onClick={onExplainTop}
+            className="ml-auto flex items-center gap-1.5 text-xs text-purple-300 hover:text-purple-200 transition-colors">
+            <BrainCircuit size={12} /> Expliquer
+          </button>
+        )}
+      </div>
     </div>
   );
 }
 
-function CicdCard({ data, loading, onDetail }: { data: any; loading: boolean; onDetail: () => void }) {
-  const runs = Array.isArray(data?.runs) ? data.runs : [];
-  const lastRun = runs[0];
-  const blocked = data?.blocked || 0;
-  const passed = runs.filter((r: any) => (r.decision || "").toUpperCase() === "PASS").length;
+// ── Carte CI/CD (M8) ─────────────────────────────────────────
+function CicdCard({ data, loading, onDetail }: {
+  data: any; loading: boolean; onDetail: () => void;
+}) {
+  const runs      = Array.isArray(data?.runs) ? data.runs : [];
+  const lastRun   = runs[0];
+  const blocked   = data?.blocked || 0;
+  const passed    = runs.filter((r: any) => (r.decision || "").toUpperCase() === "PASS").length;
   const isBlocked = lastRun && (lastRun.decision || "").toUpperCase() === "BLOCK";
 
   return (
@@ -257,14 +395,13 @@ function CicdCard({ data, loading, onDetail }: { data: any; loading: boolean; on
           <span className="text-sm font-medium text-teal-400">Pipeline CI/CD</span>
           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-400 border border-teal-500/20">M8</span>
         </div>
-
         {loading ? (
           <Loader2 size={14} className="animate-spin text-muted-foreground" />
         ) : lastRun ? (
           <span className={cn(
             "text-xs px-2 py-0.5 rounded-full border font-medium",
             isBlocked ? "bg-red-500/10 text-red-400 border-red-500/20" :
-            "bg-green-500/10 text-green-400 border-green-500/20"
+                        "bg-green-500/10 text-green-400 border-green-500/20"
           )}>
             {isBlocked ? "Bloqué" : "Validé"}
           </span>
@@ -274,9 +411,9 @@ function CicdCard({ data, loading, onDetail }: { data: any; loading: boolean; on
       {!loading && data && (
         <>
           <div className="grid grid-cols-3 gap-2 py-3 border-y border-teal-500/10">
-            <SevCount count={runs.length} label="Total runs" color="text-foreground" />
-            <SevCount count={passed} label="Succès" color="text-green-400" />
-            <SevCount count={blocked} label="Bloqués" color="text-red-400" />
+            <SevCount count={runs.length} label="Total runs"  color="text-foreground" />
+            <SevCount count={passed}      label="Succès"      color="text-green-400" />
+            <SevCount count={blocked}     label="Bloqués"     color="text-red-400" />
           </div>
 
           {lastRun && (
@@ -285,9 +422,7 @@ function CicdCard({ data, loading, onDetail }: { data: any; loading: boolean; on
               <div className="text-xs space-y-1">
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Repo</span>
-                  <span className="font-mono text-foreground truncate max-w-[140px]">
-                    {lastRun.repo || "—"}
-                  </span>
+                  <span className="font-mono text-foreground truncate max-w-[140px]">{lastRun.repo || "—"}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Critiques</span>
@@ -295,7 +430,6 @@ function CicdCard({ data, loading, onDetail }: { data: any; loading: boolean; on
                     {lastRun.critical_count || 0}
                   </span>
                 </div>
-
                 {lastRun.secrets_found && (
                   <div className="flex items-center gap-1 text-amber-400 text-[10px]">
                     <AlertTriangle size={10} />
@@ -312,35 +446,40 @@ function CicdCard({ data, loading, onDetail }: { data: any; loading: boolean; on
         <p className="text-xs text-muted-foreground">Aucune donnée disponible</p>
       )}
 
-      <button
-        onClick={onDetail}
-        className="mt-auto flex items-center gap-1.5 text-xs text-teal-400 hover:text-teal-300 transition-colors"
-      >
+      <button onClick={onDetail}
+        className="mt-auto flex items-center gap-1.5 text-xs text-teal-400 hover:text-teal-300 transition-colors">
         Voir les pipelines <ArrowRight size={12} />
       </button>
     </div>
   );
 }
 
+// ── Page principale ScanResults ───────────────────────────────
 export default function ScanResults() {
-  const navigate = useNavigate();
-  const location = useLocation();
-  const scanState = (location.state as ScanState) || {};
-  const { sastOn, dastOn, cicdOn, projectName, dastResult, sastScanId } = scanState;
+  const navigate   = useNavigate();
+  const location   = useLocation();
+  const scanState  = (location.state as ScanState) || {};
+  const { sastOn, dastOn, cicdOn, projectName, dastResult, sastScanId, sourceMode } = scanState;
+
+  const isImageMode = sourceMode === "image";
 
   const [sastData, setSastData] = useState<any>(null);
   const [dastData, setDastData] = useState<any>(dastResult || null);
   const [cicdData, setCicdData] = useState<any>(null);
 
-  const [sastLoading, setSastLoading] = useState(!!sastOn);
+  const [sastLoading, setSastLoading] = useState(!!sastOn && !isImageMode);
   const [dastLoading, setDastLoading] = useState(!!dastOn && !dastResult);
   const [cicdLoading, setCicdLoading] = useState(!!cicdOn);
+
+  const [llmLoading, setLlmLoading] = useState(false);
+  const [llmExplanation, setLlmExplanation] = useState<any | null>(null);
+  const [llmError, setLlmError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
 
     const loadSast = async () => {
-      if (!sastOn) return;
+      if (!sastOn || isImageMode) return;
 
       setSastLoading(true);
       const scanId = sastScanId || null;
@@ -358,18 +497,13 @@ export default function ScanResults() {
             Number(findings?.findings?.length || 0);
 
           if (!cancelled && stats) {
-            setSastData({
-              ...stats,
-              total,
-              top_findings: findings?.findings || [],
-            });
+            setSastData({ ...stats, total, top_findings: findings?.findings || [] });
             setSastLoading(false);
             return;
           }
         } catch (e) {
           console.error("SAST polling error:", e);
         }
-
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
 
@@ -380,7 +514,6 @@ export default function ScanResults() {
       if (!dastOn || dastResult) return;
 
       setDastLoading(true);
-
       Promise.all([dastAPI.getStatus(), dastAPI.getFindings(5)])
         .then(([status, findings]) => setDastData({
           ...status,
@@ -393,9 +526,7 @@ export default function ScanResults() {
 
     const loadCicd = async () => {
       if (!cicdOn) return;
-
       setCicdLoading(true);
-
       cicdAPI.getRuns()
         .then((r) => setCicdData(r))
         .catch(() => setCicdData(null))
@@ -406,36 +537,60 @@ export default function ScanResults() {
     loadDast();
     loadCicd();
 
-    return () => {
-      cancelled = true;
-    };
-  }, [sastOn, dastOn, cicdOn, sastScanId, dastResult]);
+    return () => { cancelled = true; };
+  }, [sastOn, dastOn, cicdOn, sastScanId, dastResult, isImageMode]);
 
-  const goToSast = () => navigate("/sast", { state: { scanId: sastScanId || null } });
-
-  const risk = globalRisk(sastData, dastData, cicdData);
-
-  const riskColors = {
-    critical: { bg: "bg-red-500/10", border: "border-red-500/30", text: "text-red-400", bar: "bg-red-500" },
-    high: { bg: "bg-amber-500/10", border: "border-amber-500/30", text: "text-amber-400", bar: "bg-amber-500" },
-    medium: { bg: "bg-blue-500/10", border: "border-blue-500/30", text: "text-blue-400", bar: "bg-blue-500" },
-    low: { bg: "bg-green-500/10", border: "border-green-500/30", text: "text-green-400", bar: "bg-green-500" },
+  const explainTopFinding = async (source: "sast" | "dast") => {
+    setLlmLoading(true);
+    setLlmExplanation(null);
+    setLlmError("");
+    try {
+      let finding: any = null;
+      if (source === "sast") {
+        finding = sastData?.top_findings?.[0];
+      } else {
+        const sid = dastData?.session_id || dastResult?.session_id;
+        const findings = await dastAPI.getFindings(1, sid);
+        finding = findings?.findings?.[0] || dastData;
+      }
+      if (!finding) throw new Error("Aucun finding disponible à expliquer");
+      const result = await vulnerabilityLLMAPI.explain(source, finding);
+      setLlmExplanation(result.explanation);
+    } catch (e: any) {
+      setLlmError(e?.message || "Erreur LLM");
+    } finally {
+      setLlmLoading(false);
+    }
   };
 
-  const rc = riskColors[risk.level];
-  const isLoading = sastLoading || dastLoading || cicdLoading;
-  const activeCount = [sastOn, dastOn, cicdOn].filter(Boolean).length;
-  const moduleLabel = [sastOn && "SAST", dastOn && "DAST", cicdOn && "CI/CD"].filter(Boolean).join(" + ");
+  const goToSast = () => navigate("/sast", { state: { scanId: sastScanId || null } });
+  const risk     = globalRisk(sastData, dastData, cicdData, sourceMode || "zip");
+
+  const riskColors = {
+    critical: { bg: "bg-red-500/10",    border: "border-red-500/30",    text: "text-red-400",    bar: "bg-red-500" },
+    high:     { bg: "bg-amber-500/10",  border: "border-amber-500/30",  text: "text-amber-400",  bar: "bg-amber-500" },
+    medium:   { bg: "bg-blue-500/10",   border: "border-blue-500/30",   text: "text-blue-400",   bar: "bg-blue-500" },
+    low:      { bg: "bg-green-500/10",  border: "border-green-500/30",  text: "text-green-400",  bar: "bg-green-500" },
+  };
+
+  const rc          = riskColors[risk.level];
+  const isLoading   = sastLoading || dastLoading || cicdLoading;
+  const activeCount = [sastOn && !isImageMode, dastOn, cicdOn && !isImageMode].filter(Boolean).length;
+  const moduleLabel = [
+    sastOn && !isImageMode && "SAST",
+    dastOn && isImageMode  && "Docker+ZAP",
+    dastOn && !isImageMode && "DAST",
+    cicdOn && !isImageMode && "CI/CD",
+  ].filter(Boolean).join(" + ");
 
   return (
     <div className="flex flex-col items-center w-full px-8 py-10">
       <div className="w-full max-w-5xl space-y-8">
 
+        {/* Header */}
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => navigate("/scan-code")}
-            className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground"
-          >
+          <button onClick={() => navigate("/scan-code")}
+            className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground">
             <ArrowLeft size={16} />
           </button>
 
@@ -444,8 +599,12 @@ export default function ScanResults() {
             <p className="text-sm text-muted-foreground mt-1">
               {projectName ? `Projet : ${projectName}` : "Analyse complète"} · {moduleLabel}
             </p>
-
-            {sastOn && (
+            {isImageMode && dastData?.docker_image_scan?.image_name && (
+              <p className="text-xs font-mono text-violet-400/70 mt-1">
+                🐳 {dastData.docker_image_scan.image_name}
+              </p>
+            )}
+            {sastOn && !isImageMode && (
               <p className="text-xs font-mono text-muted-foreground mt-1">
                 scan_id : {sastScanId || "non reçu"}
               </p>
@@ -460,55 +619,64 @@ export default function ScanResults() {
           )}
         </div>
 
+        {/* Jauge de risque global */}
         <div className={cn("rounded-xl border p-5", rc.bg, rc.border)}>
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-3">
-              <div className={cn("text-3xl font-bold font-mono", rc.text)}>
-                {risk.label}
-              </div>
+              <div className={cn("text-3xl font-bold font-mono", rc.text)}>{risk.label}</div>
               <div>
                 <p className="text-sm text-muted-foreground">Niveau de risque global</p>
                 <p className="text-xs text-muted-foreground/60">Score agrégé {moduleLabel}</p>
               </div>
             </div>
-
             <div className="text-right">
-              <div className={cn("text-4xl font-bold font-mono", rc.text)}>
-                {risk.score}
-              </div>
+              <div className={cn("text-4xl font-bold font-mono", rc.text)}>{risk.score}</div>
               <div className="text-[10px] text-muted-foreground/60 mt-0.5">/ 100</div>
             </div>
           </div>
-
           <div className="w-full h-1.5 rounded-full bg-cyber-border/40 overflow-hidden">
             <div className={cn("h-full rounded-full transition-all", rc.bar)} style={{ width: `${risk.score}%` }} />
           </div>
         </div>
 
+        {/* Cartes résultats */}
         <div className={cn(
           "grid gap-5",
           activeCount === 1 ? "grid-cols-1 max-w-sm" :
           activeCount === 2 ? "grid-cols-2" :
-          "grid-cols-3"
+                              "grid-cols-3"
         )}>
-          {sastOn && (
+          {/* SAST — uniquement si pas mode image */}
+          {sastOn && !isImageMode && (
             <SastCard
               data={sastData}
               loading={sastLoading}
               scanId={sastScanId || null}
               onDetail={goToSast}
+              onExplainTop={() => explainTopFinding("sast")}
             />
           )}
 
-          {dastOn && (
+          {/* DAST — carte Docker si mode image, carte classique sinon */}
+          {dastOn && isImageMode && (
+            <DockerImageCard
+              data={dastData}
+              loading={dastLoading}
+              onDetail={() => navigate("/dast")}
+              onExplainTop={() => explainTopFinding("dast")}
+            />
+          )}
+          {dastOn && !isImageMode && (
             <DastCard
               data={dastData}
               loading={dastLoading}
               onDetail={() => navigate("/dast")}
+              onExplainTop={() => explainTopFinding("dast")}
             />
           )}
 
-          {cicdOn && (
+          {/* CI/CD — uniquement si pas mode image */}
+          {cicdOn && !isImageMode && (
             <CicdCard
               data={cicdData}
               loading={cicdLoading}
@@ -517,49 +685,91 @@ export default function ScanResults() {
           )}
         </div>
 
+
+        {/* Explication LLM */}
+        {(llmLoading || llmExplanation || llmError) && (
+          <div className="rounded-xl border border-purple-500/25 bg-purple-500/5 p-5">
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <h2 className="text-sm font-semibold flex items-center gap-2 text-purple-300">
+                <BrainCircuit size={15} />
+                Explication LLM du finding prioritaire
+              </h2>
+              <button
+                onClick={() => { setLlmExplanation(null); setLlmError(""); }}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            {llmLoading ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 size={14} className="animate-spin" />
+                Génération de l'explication...
+              </div>
+            ) : llmError ? (
+              <p className="text-sm text-red-300">{llmError}</p>
+            ) : (
+              <div className="space-y-3 text-sm">
+                <p>{llmExplanation?.resume_simple || "—"}</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                  <div className="rounded-lg border border-cyber-border bg-card/40 p-3">
+                    <p className="uppercase tracking-wide text-muted-foreground">Impact</p>
+                    <p className="mt-1 text-muted-foreground">{llmExplanation?.impact || "—"}</p>
+                  </div>
+                  <div className="rounded-lg border border-cyber-border bg-card/40 p-3">
+                    <p className="uppercase tracking-wide text-muted-foreground">Correction</p>
+                    <p className="mt-1 text-muted-foreground">{llmExplanation?.correction_recommandee || "—"}</p>
+                  </div>
+                </div>
+                {llmExplanation?.exemple_correction && (
+                  <pre className="rounded-lg bg-cyber-darker p-3 text-xs overflow-auto whitespace-pre-wrap text-muted-foreground">
+                    {llmExplanation.exemple_correction}
+                  </pre>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Actions bas de page */}
         <div className="flex items-center gap-3 pt-2 border-t border-cyber-border/40 flex-wrap">
-          <button
-            onClick={() => navigate("/scan-code")}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg border border-cyber-border text-sm text-muted-foreground hover:text-foreground hover:bg-card/50 transition-colors"
-          >
+          <button onClick={() => navigate("/scan-code")}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg border border-cyber-border text-sm text-muted-foreground hover:text-foreground hover:bg-card/50 transition-colors">
             <ArrowLeft size={14} />
             Nouveau scan
           </button>
 
-          {sastOn && (
-            <button
-              onClick={goToSast}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-blue-500/30 bg-blue-500/5 text-sm text-blue-400 hover:bg-blue-500/10 transition-colors"
-            >
+          {sastOn && !isImageMode && (
+            <button onClick={goToSast}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-blue-500/30 bg-blue-500/5 text-sm text-blue-400 hover:bg-blue-500/10 transition-colors">
               <ExternalLink size={14} />
               SAST complet
             </button>
           )}
 
           {dastOn && (
-            <button
-              onClick={() => navigate("/dast")}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-red-500/30 bg-red-500/5 text-sm text-red-400 hover:bg-red-500/10 transition-colors"
-            >
+            <button onClick={() => navigate("/dast")}
+              className={cn(
+                "flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-colors",
+                isImageMode
+                  ? "border border-violet-500/30 bg-violet-500/5 text-violet-400 hover:bg-violet-500/10"
+                  : "border border-red-500/30 bg-red-500/5 text-red-400 hover:bg-red-500/10"
+              )}>
               <ExternalLink size={14} />
-              DAST complet
+              {isImageMode ? "DAST + Trivy complet" : "DAST complet"}
             </button>
           )}
 
-          {cicdOn && (
-            <button
-              onClick={() => navigate("/cicd")}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-teal-500/30 bg-teal-500/5 text-sm text-teal-400 hover:bg-teal-500/10 transition-colors"
-            >
+          {cicdOn && !isImageMode && (
+            <button onClick={() => navigate("/cicd")}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-teal-500/30 bg-teal-500/5 text-sm text-teal-400 hover:bg-teal-500/10 transition-colors">
               <ExternalLink size={14} />
               CI/CD complet
             </button>
           )}
 
-          <button
-            onClick={() => navigate("/incidents")}
-            className="ml-auto flex items-center gap-2 px-4 py-2 rounded-lg bg-cyber-violet hover:bg-cyber-violet-dark text-sm text-white transition-colors"
-          >
+          <button onClick={() => navigate("/incidents")}
+            className="ml-auto flex items-center gap-2 px-4 py-2 rounded-lg bg-cyber-violet hover:bg-cyber-violet-dark text-sm text-white transition-colors">
             Voir les incidents générés <ArrowRight size={14} />
           </button>
         </div>
