@@ -7,9 +7,11 @@
 #     - DAST confirmé
 #     - OU HIDS/Wazuh confirmé
 # C = Criticité Asset [0-10]
+#
 # NOUVEAU :
 #   [LLM] attack_type Llama intégré dans titre + description incident
 #   [M11] hids_confirmed renforce score_e
+#   [M12] AssetResolver récupère la criticité réelle depuis Asset Registry
 # ============================================================
 
 import json
@@ -26,18 +28,19 @@ from app.models.alert import Alert, SeverityLevel
 from app.models.incident import Incident, IncidentStatus
 from app.models.sast_finding import SASTFinding
 from app.services.mitre_service import MitreEnrichmentEngine
+from app.services.asset_resolver import AssetResolver
 
 logger = logging.getLogger(__name__)
 
 # SLA par niveau de sévérité
 SLA_MAP = {
     SeverityLevel.CRITIQUE: timedelta(hours=1),
-    SeverityLevel.ELEVE:    timedelta(hours=4),
-    SeverityLevel.MOYEN:    timedelta(hours=48),
-    SeverityLevel.FAIBLE:   timedelta(days=14),
+    SeverityLevel.ELEVE: timedelta(hours=4),
+    SeverityLevel.MOYEN: timedelta(hours=48),
+    SeverityLevel.FAIBLE: timedelta(days=14),
 }
 
-# Criticité par défaut des assets connus
+# Fallback si aucun asset n'est trouvé en base
 DEFAULT_ASSET_CRITICALITY = {
     "db-prod": 9.0,
     "api-gateway": 8.0,
@@ -48,9 +51,9 @@ DEFAULT_ASSET_CRITICALITY = {
     "test": 3.0,
 }
 
-# Mapping optionnel IP -> criticité
+# Fallback IP -> criticité si aucun asset n'est trouvé en base
 IP_CRITICALITY_MAP = {
-    "10.0.0.5":  9.0,
+    "10.0.0.5": 9.0,
     "10.0.0.10": 8.0,
     "10.0.0.20": 7.0,
 
@@ -68,6 +71,7 @@ class RiskScoringEngine:
 
     def __init__(self):
         self.mitre_engine = MitreEnrichmentEngine()
+        self.asset_resolver = AssetResolver()
         self.redis: Optional[aioredis.Redis] = None
 
     async def _get_redis(self) -> aioredis.Redis:
@@ -75,7 +79,7 @@ class RiskScoringEngine:
             self.redis = await aioredis.from_url(
                 settings.REDIS_URL,
                 encoding="utf-8",
-                decode_responses=True
+                decode_responses=True,
             )
         return self.redis
 
@@ -88,7 +92,7 @@ class RiskScoringEngine:
         anomaly_score: float = 0.0,
         cvss_score: float = 0.0,
         dast_confirmed: bool = False,
-        asset_criticality: float = 5.0
+        asset_criticality: float = 5.0,
     ) -> dict:
         """
         Calcule le score R et détermine le niveau de sévérité.
@@ -110,10 +114,10 @@ class RiskScoringEngine:
         w_c = settings.SCORE_R_WEIGHT_C
 
         r = (
-            w_a * anomaly_score +
-            w_v * cvss_score +
-            w_e * e_score +
-            w_c * asset_criticality
+            w_a * anomaly_score
+            + w_v * cvss_score
+            + w_e * e_score
+            + w_c * asset_criticality
         )
         r = round(min(r, 10.0), 2)
 
@@ -141,16 +145,61 @@ class RiskScoringEngine:
             ),
         }
 
-    def get_asset_criticality(self, asset_ip: str = "", asset_name: str = "") -> float:
-        """Retourne la criticité d'un asset [0-10]."""
+    async def get_asset_criticality(
+        self,
+        asset_ip: str = "",
+        asset_name: str = "",
+        fallback_src_ip: str = "",
+    ) -> float:
+        """
+        Retourne la criticité d'un asset [0-10].
+
+        Priorité :
+        1. Asset Registry par IP/hostname
+        2. Asset Registry par src_ip si dest_ip inconnu
+        3. IP_CRITICALITY_MAP fallback
+        4. DEFAULT_ASSET_CRITICALITY fallback par nom
+        5. Valeur par défaut = 5.0
+        """
+
+        asset_ip = (asset_ip or "").strip()
+        asset_name = (asset_name or "").strip()
+        fallback_src_ip = (fallback_src_ip or "").strip()
+
+        # 1. Chercher dans Asset Registry avec IP/hostname principal
+        try:
+            asset = await self.asset_resolver.resolve(
+                ip=asset_ip,
+                hostname=asset_name,
+            )
+            if asset:
+                return max(0.0, min(float(asset.criticality), 10.0))
+        except Exception as e:
+            logger.warning("AssetResolver erreur sur asset principal: %s", e)
+
+        # 2. Chercher dans Asset Registry avec src_ip
+        try:
+            if fallback_src_ip:
+                asset = await self.asset_resolver.resolve(ip=fallback_src_ip)
+                if asset:
+                    return max(0.0, min(float(asset.criticality), 10.0))
+        except Exception as e:
+            logger.warning("AssetResolver erreur sur fallback_src_ip: %s", e)
+
+        # 3. Fallback IP statique
         if asset_ip and asset_ip in IP_CRITICALITY_MAP:
             return IP_CRITICALITY_MAP[asset_ip]
 
-        asset_lower = (asset_name or "").lower()
+        if fallback_src_ip and fallback_src_ip in IP_CRITICALITY_MAP:
+            return IP_CRITICALITY_MAP[fallback_src_ip]
+
+        # 4. Fallback par nom
+        asset_lower = asset_name.lower()
         for keyword, criticality in DEFAULT_ASSET_CRITICALITY.items():
             if keyword in asset_lower:
                 return criticality
 
+        # 5. Défaut
         return 5.0
 
     # ============================================================
@@ -161,15 +210,17 @@ class RiskScoringEngine:
         """
         Crée un incident depuis une alerte IDS fusionnée M3.
         Cherche des findings SAST corrélés pour enrichir le score R.
+
         [LLM] attack_type intégré dans titre et description.
         [M11] hids_confirmed augmente score_e.
+        [M12] criticité réelle depuis Asset Registry.
         """
 
         anomaly_score = max(0.0, min((alert.confidence or 0.0) * 10.0, 10.0))
 
         sast_findings = await self._find_related_sast(
             alert.dest_ip,
-            alert.technique_id
+            alert.technique_id,
         )
 
         cvss_score = 0.0
@@ -203,16 +254,19 @@ class RiskScoringEngine:
             or sast_dast_confirmed
         )
 
-        asset_criticality = self.get_asset_criticality(
-            alert.dest_ip or "",
-            alert.dest_ip or ""
+        # M12 — Criticité réelle depuis Asset Registry
+        # Priorité : dest_ip, puis src_ip si la machine surveillée est source
+        asset_criticality = await self.get_asset_criticality(
+            asset_ip=alert.dest_ip or "",
+            asset_name=getattr(alert, "asset_name", "") or alert.dest_ip or "",
+            fallback_src_ip=alert.src_ip or "",
         )
 
         score_result = self.compute_score_r(
             anomaly_score=anomaly_score,
             cvss_score=cvss_score,
             dast_confirmed=exploit_confirmed,
-            asset_criticality=asset_criticality
+            asset_criticality=asset_criticality,
         )
 
         severity_enum = SeverityLevel(score_result["severity"])
@@ -246,7 +300,7 @@ class RiskScoringEngine:
             ),
 
             asset_ip=alert.dest_ip,
-            asset_name=alert.dest_ip,
+            asset_name=getattr(alert, "asset_name", None) or alert.dest_ip,
             asset_criticality=asset_criticality,
             sla_deadline=sla_deadline,
             description=self._build_description(
@@ -266,10 +320,12 @@ class RiskScoringEngine:
             await db.refresh(incident)
 
         logger.info(
-            "📋 Incident créé | #%s | R=%s | E=%s | severity=%s | hids_confirmed=%s | dast_confirmed=%s | %s",
+            "📋 Incident créé | #%s | R=%s | E=%s | C=%s | severity=%s | "
+            "hids_confirmed=%s | dast_confirmed=%s | %s",
             incident.id,
             incident.score_r,
             incident.score_e,
+            incident.score_c,
             incident.severity.value,
             runtime_hids_confirmed,
             bool(runtime_dast_confirmed or sast_dast_confirmed),
@@ -288,13 +344,16 @@ class RiskScoringEngine:
         if not finding.cvss_score or finding.cvss_score < 7.0:
             return None
 
-        asset_criticality = self.get_asset_criticality("", finding.repo_name or "")
+        asset_criticality = await self.get_asset_criticality(
+            asset_ip="",
+            asset_name=finding.repo_name or "",
+        )
 
         score_result = self.compute_score_r(
             anomaly_score=0.0,
             cvss_score=finding.cvss_score,
             dast_confirmed=bool(getattr(finding, "dast_confirmed", False)),
-            asset_criticality=asset_criticality
+            asset_criticality=asset_criticality,
         )
 
         severity_enum = SeverityLevel(score_result["severity"])
@@ -338,6 +397,7 @@ class RiskScoringEngine:
                 f"Ligne: {finding.line_number}\n"
                 f"Score R: {score_result['score_r']}\n"
                 f"Score E: {score_result['score_e']}\n"
+                f"Score C: {score_result['score_c']}\n"
                 f"Formule: {score_result['formula']}"
             ),
             detected_at=now,
@@ -394,7 +454,7 @@ class RiskScoringEngine:
     async def _find_related_sast(
         self,
         asset_ip: str,
-        technique_id: Optional[str]
+        technique_id: Optional[str],
     ) -> List[SASTFinding]:
         """Cherche les findings SAST corrélés par technique MITRE."""
         if not technique_id:
@@ -449,13 +509,13 @@ class RiskScoringEngine:
             f"Score R = {score_result['score_r']} ({score_result['severity']})",
             f"Formule : {score_result['formula']}",
             "",
-            f"Composants du score :",
+            "Composants du score :",
             f"  - A Anomalie IDS : {score_result['score_a']}",
             f"  - V CVSS/MITRE/SAST : {score_result['score_v']}",
             f"  - E Exploitabilité confirmée : {score_result['score_e']}",
             f"  - C Criticité asset : {score_result['score_c']}",
             "",
-            f"Confirmations :",
+            "Confirmations :",
             f"  - DAST confirmé : {dast_confirmed}",
             f"  - HIDS/Wazuh confirmé : {hids_confirmed}",
             f"  - Exploit confirmé : {exploit_confirmed}",
@@ -500,6 +560,8 @@ class RiskScoringEngine:
                 "technique_id": incident.technique_id,
                 "tactic": incident.tactic,
                 "asset_ip": incident.asset_ip,
+                "asset_name": incident.asset_name,
+                "asset_criticality": incident.asset_criticality,
                 "sla_deadline": incident.sla_deadline.isoformat() if incident.sla_deadline else None,
                 "detected_at": incident.detected_at.isoformat() if incident.detected_at else None,
             })
@@ -516,6 +578,9 @@ class RiskScoringEngine:
                 "id": incident.id,
                 "title": incident.title,
                 "score_r": incident.score_r,
+                "score_c": incident.score_c,
+                "asset_ip": incident.asset_ip,
+                "asset_name": incident.asset_name,
                 "sla": "< 1 heure",
                 "apt_groups": incident.apt_groups,
                 "mitre_url": incident.mitre_url,
@@ -526,9 +591,10 @@ class RiskScoringEngine:
             await r.setex(f"critical:{incident.id}", 86400, payload)
 
             logger.critical(
-                "🚨 INCIDENT CRITIQUE #%s | R=%s | %s | SLA < 1 heure",
+                "🚨 INCIDENT CRITIQUE #%s | R=%s | C=%s | %s | SLA < 1 heure",
                 incident.id,
                 incident.score_r,
+                incident.score_c,
                 incident.title,
             )
         except Exception as e:
