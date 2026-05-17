@@ -1,0 +1,8 @@
+hostname,ip_address,environment,criticality,owner,tags
+web-prod-01,10.16.2.10,production,7.0,equipe-web,"web,nginx"
+api-prod-01,10.16.2.20,production,8.0,equipe-api,"api,python"
+db-prod-01,10.16.2.30,production,10.0,equipe-dba,"database,prod"
+auth-prod,10.16.2.40,production,9.0,equipe-sec,"auth,ldap"
+k8s-worker-1,10.16.2.50,production,6.0,equipe-infra,"k8s"
+test-vm-01,10.16.2.80,test,3.0,equipe-dev,"test"
+
