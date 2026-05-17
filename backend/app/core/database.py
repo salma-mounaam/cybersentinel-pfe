@@ -29,9 +29,15 @@ class Base(DeclarativeBase):
 
 
 async def init_db():
-    import app.models  # important pour enregistrer les tables
+    # Important : importer tous les modèles ici pour que SQLAlchemy crée les tables
+    import app.models  # noqa
+
+    # M12 — Asset Registry
+    from app.models import asset  # noqa
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
     logger.info("Tables créées avec succès")
 
 

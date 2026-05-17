@@ -16,31 +16,49 @@ from app.core.database import init_db
 # ---- Routers API ----
 from app.api import alerts, ml, fusion, mitre, incidents, scoring, sast, dast, cicd
 from app.api import websocket as ws_router
+from app.api import hids as hids_router
+from app.api import wazuh
+from app.api import assets as assets_router
+
+# ---- Routers supplémentaires ----
+from app.api.reports import router as reports_router
+from app.api.vulnerability_llm import router as vulnerability_llm_router
 
 # ---- Services background ----
 from app.services.suricata_service import SuricataEveWatcher
 from app.services.incident_consumer import IncidentConsumer
 from app.services.redis_ws_bridge import redis_ws_bridge
-from app.api.reports import router as reports_router
-from app.api.vulnerability_llm import router as vulnerability_llm_router
+from app.services.wazuh_service import WazuhConsumer
+
+# ============================================================
+# Logging
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cybersentinel")
 
+# ============================================================
+# Instances services background
+# ============================================================
+
 watcher = SuricataEveWatcher()
 consumer = IncidentConsumer()
+wazuh_consumer = WazuhConsumer()
 
 # Références des tâches asyncio
 watcher_task: Optional[asyncio.Task] = None
 consumer_task: Optional[asyncio.Task] = None
+wazuh_task: Optional[asyncio.Task] = None
 redis_bridge_task: Optional[asyncio.Task] = None
 
 
 # ============================================================
 # Lifecycle
 # ============================================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global watcher_task, consumer_task, redis_bridge_task
+    global watcher_task, consumer_task, wazuh_task, redis_bridge_task
 
     logger.info("🚀 CyberSentinel démarrage...")
 
@@ -52,23 +70,30 @@ async def lifespan(app: FastAPI):
         # M1 — Watcher Suricata
         watcher_task = asyncio.create_task(
             watcher.start(),
-            name="suricata-watcher"
+            name="suricata-watcher",
         )
         logger.info("👁️ Suricata Eve watcher démarré")
 
         # M7 — Consommateur incidents
         consumer_task = asyncio.create_task(
             consumer.start(),
-            name="incident-consumer"
+            name="incident-consumer",
         )
         logger.info("📥 Incident consumer démarré")
 
         # M9 — Bridge Redis -> WebSocket
         redis_bridge_task = asyncio.create_task(
             redis_ws_bridge.start(),
-            name="redis-ws-bridge"
+            name="redis-ws-bridge",
         )
         logger.info("🌉 Redis→WebSocket bridge démarré")
+
+        # M11 — Wazuh Consumer
+        wazuh_task = asyncio.create_task(
+            wazuh_consumer.start(),
+            name="wazuh-consumer",
+        )
+        logger.info("🛡️ Wazuh consumer démarré")
 
         yield
 
@@ -87,23 +112,42 @@ async def lifespan(app: FastAPI):
             logger.warning("Erreur arrêt consumer: %s", e)
 
         try:
+            await wazuh_consumer.stop()
+        except Exception as e:
+            logger.warning("Erreur arrêt wazuh_consumer: %s", e)
+
+        try:
             await redis_ws_bridge.stop()
         except Exception as e:
             logger.warning("Erreur arrêt redis_ws_bridge: %s", e)
 
         # Annulation des tâches encore actives
-        tasks = [watcher_task, consumer_task, redis_bridge_task]
+        tasks = [
+            watcher_task,
+            consumer_task,
+            wazuh_task,
+            redis_bridge_task,
+        ]
+
         for task in tasks:
             if task and not task.done():
                 task.cancel()
 
         # Attendre leur terminaison sans bloquer l'arrêt global
         pending = [task for task in tasks if task is not None]
+
         if pending:
             results = await asyncio.gather(*pending, return_exceptions=True)
+
             for result in results:
-                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
-                    logger.warning("Erreur fermeture tâche background: %s", result)
+                if isinstance(result, Exception) and not isinstance(
+                    result,
+                    asyncio.CancelledError,
+                ):
+                    logger.warning(
+                        "Erreur fermeture tâche background: %s",
+                        result,
+                    )
 
         logger.info("✅ CyberSentinel arrêté proprement")
 
@@ -111,6 +155,7 @@ async def lifespan(app: FastAPI):
 # ============================================================
 # Application
 # ============================================================
+
 app = FastAPI(
     title="CyberSentinel API",
     description="Plateforme Purple Team — Détection Zero-Day & Priorisation des Menaces",
@@ -121,6 +166,7 @@ app = FastAPI(
 # ============================================================
 # CORS
 # ============================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -132,31 +178,136 @@ app.add_middleware(
 # ============================================================
 # Routers REST
 # ============================================================
-app.include_router(alerts.router, prefix="/api/alerts", tags=["M1 — IDS Alerts"])
-app.include_router(ml.router, prefix="/api/ml", tags=["M2/M10 — ML"])
-app.include_router(fusion.router, prefix="/api/fusion", tags=["M3 — Fusion Hybride"])
-app.include_router(mitre.router, prefix="/api/mitre", tags=["M6 — Enrichissement MITRE"])
-app.include_router(incidents.router, prefix="/api/incidents", tags=["M7 — Incidents"])
-app.include_router(scoring.router, prefix="/api/scoring", tags=["M7 — Scoring"])
-app.include_router(sast.router, prefix="/api/sast", tags=["M4 — SAST"])
-app.include_router(dast.router, prefix="/api/dast", tags=["M5 — DAST"])
-app.include_router(cicd.router, prefix="/api/cicd", tags=["M8 — CI/CD"])
-app.include_router(reports_router, prefix="/api/reports", tags=["M11 — Rapports"])
-app.include_router(vulnerability_llm_router, prefix="/api", tags=["M12 — LLM Vulnerabilities"])
+
+app.include_router(
+    alerts.router,
+    prefix="/api/alerts",
+    tags=["M1 — IDS Alerts"],
+)
+
+app.include_router(
+    ml.router,
+    prefix="/api/ml",
+    tags=["M2/M10 — ML"],
+)
+
+app.include_router(
+    fusion.router,
+    prefix="/api/fusion",
+    tags=["M3 — Fusion Hybride"],
+)
+
+app.include_router(
+    mitre.router,
+    prefix="/api/mitre",
+    tags=["M6 — Enrichissement MITRE"],
+)
+
+app.include_router(
+    incidents.router,
+    prefix="/api/incidents",
+    tags=["M7 — Incidents"],
+)
+
+app.include_router(
+    scoring.router,
+    prefix="/api/scoring",
+    tags=["M7 — Scoring"],
+)
+
+app.include_router(
+    sast.router,
+    prefix="/api/sast",
+    tags=["M4 — SAST"],
+)
+
+app.include_router(
+    dast.router,
+    prefix="/api/dast",
+    tags=["M5 — DAST"],
+)
+
+app.include_router(
+    cicd.router,
+    prefix="/api/cicd",
+    tags=["M8 — CI/CD"],
+)
+
+app.include_router(
+    reports_router,
+    prefix="/api/reports",
+    tags=["M11 — Rapports"],
+)
+
+app.include_router(
+    wazuh.router,
+    prefix="/api/wazuh",
+    tags=["M11 — Wazuh"],
+)
+
+app.include_router(
+    hids_router.router,
+    prefix="/api/hids",
+    tags=["M11 — HIDS"],
+)
+
+# ============================================================
+# M12 — Asset Registry / Multi-Machine
+# Routes créées :
+# GET    /api/assets
+# POST   /api/assets
+# PATCH  /api/assets/{asset_id}
+# GET    /api/assets/at-risk
+# POST   /api/agents/heartbeat
+# GET    /api/agents/status
+# ============================================================
+
+app.include_router(
+    assets_router.router,
+    prefix="/api",
+    tags=["M12 — Assets"],
+)
+
+app.include_router(
+    vulnerability_llm_router,
+    prefix="/api",
+    tags=["M12 — LLM Vulnerabilities"],
+)
+
 # ============================================================
 # Routers WebSocket
 # ============================================================
-app.include_router(ws_router.router, prefix="/ws", tags=["M9 — WebSocket"])
+
+app.include_router(
+    ws_router.router,
+    prefix="/ws",
+    tags=["M9 — WebSocket"],
+)
 
 # ============================================================
 # Endpoints système
 # ============================================================
+
 @app.get("/")
 async def root():
     return {
         "message": "CyberSentinel API running",
         "service": "CyberSentinel",
         "version": "2.0.0",
+        "modules": {
+            "M1": "Suricata IDS",
+            "M2": "Machine Learning",
+            "M3": "Fusion Hybride",
+            "M4": "SAST",
+            "M5": "DAST",
+            "M6": "MITRE ATT&CK",
+            "M7": "Incidents & Scoring",
+            "M8": "CI/CD Security",
+            "M9": "WebSocket temps réel",
+            "M10": "ML avancé",
+            "M11": "Wazuh HIDS",
+            "M12": "Asset Registry & LLM Vulnerability Analysis",
+        },
     }
 
 
@@ -166,4 +317,16 @@ async def health():
         "status": "ok",
         "service": "CyberSentinel",
         "version": "2.0.0",
+        "background_services": {
+            "suricata_watcher": watcher_task is not None and not watcher_task.done(),
+            "incident_consumer": consumer_task is not None and not consumer_task.done(),
+            "wazuh_consumer": wazuh_task is not None and not wazuh_task.done(),
+            "redis_ws_bridge": redis_bridge_task is not None and not redis_bridge_task.done(),
+        },
+        "modules": {
+            "asset_registry": "enabled",
+            "wazuh": "enabled",
+            "hids": "enabled",
+            "llm_vulnerability_analysis": "enabled",
+        },
     }
