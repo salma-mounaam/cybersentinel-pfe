@@ -4,6 +4,13 @@
 #   main-net    : services principaux
 #   mgmt-net    : canal backend ↔ ZAP
 #   sandbox-net : cibles DAST internal:true — ZERO internet
+#
+# Version corrigée PCAP DAST :
+#   - Volume ./data/dast_captures monté dans ZAP
+#   - Volume ./data/dast_captures monté dans backend/celery
+#   - ZAP utilise l'image cybersentinel-zap:custom avec tcpdump
+#   - Backend peut lire les PCAP générés par ZAP
+#   - ZAP lancé en privileged pour autoriser tcpdump -i any
 # ============================================================
 
 services:
@@ -20,7 +27,11 @@ services:
     networks:
       - main-net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-csadmin} -d ${POSTGRES_DB:-cybersentinel}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-csadmin} -d ${POSTGRES_DB:-cybersentinel}"
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -53,42 +64,73 @@ services:
     container_name: cybersentinel_backend
     restart: unless-stopped
     env_file: .env
+
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     environment:
       CYBERSENTINEL_COMPOSE_FILE: /app/docker-compose.yml
       DOCKER_HOST: unix:///var/run/docker.sock
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
       PYTHONPATH: /app
+      WATCHFILES_FORCE_POLLING: "false"
+
+      # LLM / Ollama
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: llama3.1:8b
+
+      # PCAP DAST
+      PCAP_DIR: /app/data/dast_captures
+
     volumes:
       - ./backend:/app
       - ./.env:/app/.env:ro
       - ./docker-compose.yml:/app/docker-compose.yml:ro
+
+      # Données applicatives
       - ./data:/app/data
+
+      # Volume partagé PCAP DAST côté backend
       - ./data/dast_captures:/shared/dast_captures
+
+      # Modèles ML
       - ml_models:/app/data/models
+
+      # Logs Suricata
       - suricata_logs:/var/log/suricata:ro
+
+      # Docker socket pour lancer ZAP / cibles DAST
       - /var/run/docker.sock:/var/run/docker.sock
+
     networks:
       - main-net
       - mgmt-net
+
     ports:
       - "8000:8000"
+
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
     command: >
       python -m uvicorn app.main:app
       --host 0.0.0.0
       --port 8000
       --reload
       --reload-dir /app/app
+      --reload-exclude /app/data
+      --reload-exclude /app/data/uploads_dast
+      --reload-exclude /app/data/dast_captures
 
   celery_worker:
     build:
@@ -98,24 +140,43 @@ services:
     restart: unless-stopped
     command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=2
     env_file: .env
+
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
+
     environment:
       PYTHONPATH: /app
       DOCKER_HOST: unix:///var/run/docker.sock
+      PCAP_DIR: /app/data/dast_captures
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: llama3.1:8b
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     volumes:
       - ./backend:/app
       - ./.env:/app/.env:ro
+
+      # Données applicatives
       - ./data:/app/data
+
+      # Volume partagé PCAP DAST côté celery
       - ./data/dast_captures:/shared/dast_captures
+
+      # Modèles ML
       - ml_models:/app/data/models
+
+      # Docker socket
       - /var/run/docker.sock:/var/run/docker.sock
+
     networks:
       - main-net
       - mgmt-net
+
     healthcheck:
       disable: true
 
@@ -127,21 +188,38 @@ services:
     restart: unless-stopped
     command: celery -A app.core.celery_app.celery_app beat --loglevel=info
     env_file: .env
+
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
+
     environment:
       PYTHONPATH: /app
+      PCAP_DIR: /app/data/dast_captures
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: llama3.1:8b
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     volumes:
       - ./backend:/app
       - ./.env:/app/.env:ro
+
+      # Données applicatives
       - ./data:/app/data
+
+      # Volume partagé PCAP DAST côté celery beat
       - ./data/dast_captures:/shared/dast_captures
+
+      # Modèles ML
       - ml_models:/app/data/models
+
     networks:
       - main-net
+
     healthcheck:
       disable: true
 
@@ -151,13 +229,17 @@ services:
       dockerfile: ../docker/frontend/Dockerfile
     container_name: cybersentinel_frontend
     restart: unless-stopped
+
     networks:
       - main-net
+
     ports:
       - "3000:3000"
+
     depends_on:
       backend:
         condition: service_healthy
+
     environment:
       REACT_APP_API_URL: http://localhost:8000/api
       REACT_APP_API_ROOT: http://localhost:8000
@@ -168,14 +250,17 @@ services:
     container_name: cybersentinel_suricata
     restart: unless-stopped
     network_mode: host
+
     cap_add:
       - NET_ADMIN
       - NET_RAW
       - SYS_NICE
+
     volumes:
       - ./suricata/rules:/etc/suricata/rules
       - ./suricata/suricata.yaml:/etc/suricata/suricata.yaml
       - suricata_logs:/var/log/suricata
+
     command: >
       -i ens192
       --set default-rule-path=/etc/suricata/rules
@@ -187,6 +272,7 @@ services:
     image: cybersentinel-zap:custom
     container_name: cybersentinel_zap
     restart: "no"
+
     command:
       [
         "zap.sh",
@@ -202,17 +288,43 @@ services:
         "-config",
         "api.addrs.addr.regex=true"
       ]
+
+    # ========================================================
+    # FIX PCAP :
+    # tcpdump -i any échoue sans privilèges élevés :
+    # "Operation not permitted"
+    # Pour le lab/PFE, privileged:true est la solution la plus fiable.
+    # ========================================================
+    privileged: true
+
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+
     volumes:
+      # Volume crucial : ZAP écrit ici les PCAP
       - ./data/dast_captures:/shared/dast_captures
+
     networks:
       - sandbox-net
       - mgmt-net
+
     ports:
       - "8090:8090"
+
     profiles:
       - dast
+
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8090/JSON/core/view/version/ || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:8090/JSON/core/view/version/ || exit 1"
+        ]
       interval: 15s
       timeout: 10s
       retries: 5
@@ -222,10 +334,13 @@ services:
     image: webgoat/webgoat:latest
     container_name: cybersentinel_webgoat
     restart: "no"
+
     networks:
       - sandbox-net
+
     profiles:
       - dast
+
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/WebGoat/ || exit 1"]
       interval: 15s
@@ -237,11 +352,39 @@ services:
     image: vulnerables/web-dvwa:latest
     container_name: cybersentinel_dvwa
     restart: "no"
+
     networks:
       - sandbox-net
+
     profiles:
       - dast
 
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.7.0
+    container_name: cybersentinel_wazuh
+    restart: unless-stopped
+
+    ports:
+      - "1514:1514/udp"
+      - "1515:1515/tcp"
+      - "55000:55000/tcp"
+
+    environment:
+      - INDEXER_URL=https://wazuh-indexer:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=SecretPassword
+      - FILEBEAT_SSL_VERIFICATION_MODE=none
+
+    volumes:
+      - wazuh_data:/var/ossec/data
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+
+    networks:
+      - main-net
 networks:
   main-net:
     name: cybersentinel_main-net
@@ -253,11 +396,17 @@ networks:
 
   sandbox-net:
     name: cybersentinel_sandbox-net
-    driver: bridge
-    internal: true
+    external: true
+
 
 volumes:
   postgres_data:
   redis_data:
   suricata_logs:
   ml_models:
+  wazuh_data:
+  wazuh_logs:
+  wazuh_etc:
+  wazuh_queue:
+  wazuh_integrations:
+  wazuh_active_response:
