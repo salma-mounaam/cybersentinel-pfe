@@ -4,9 +4,15 @@
 //
 // Version modifiée :
 //   - Ajout API LLM pour expliquer les vulnérabilités SAST / DAST
+//   - Ajout API Asset Registry / Agents Heartbeat
 //   - Endpoints :
 //       POST /api/vulnerabilities/llm/explain
 //       POST /api/vulnerabilities/llm/explain-many
+//       GET  /api/assets
+//       GET  /api/assets/at-risk
+//       GET  /api/agents/status
+//       POST /api/assets
+//       PATCH /api/assets/{id}
 // ============================================================
 
 const API_BASE =
@@ -237,7 +243,6 @@ export const dastAPI = {
     deploy_target?: boolean;
   }) => post<any>("/dast/start", payload),
 
-  // ── Mode ZIP — upload projet → build → sandbox → ZAP ───────
   startFromUpload: (file: File) => {
     const formData = new FormData();
 
@@ -246,7 +251,6 @@ export const dastAPI = {
     return postForm<any>("/dast/start/from-upload", formData);
   },
 
-  // ── Mode Image Docker pré-buildée ──────────────────────────
   startFromImage: (payload: {
     image: string;
     port?: number;
@@ -254,7 +258,6 @@ export const dastAPI = {
     scan_profile?: string;
   }) => post<any>("/dast/start/from-image", payload),
 
-  // ── Mode GitHub → clone → build → sandbox → ZAP ────────────
   startFromGit: (payload: {
     repo_url: string;
     branch?: string;
@@ -275,6 +278,19 @@ export const dastAPI = {
 
   getFindingsHistory: (limit = 100) =>
     get<any>(`/dast/findings/history?limit=${limit}`),
+};
+
+// ── M12 Asset Registry / Agents ──────────────────────────────
+export const assetsAPI = {
+  getAll: () => get<any>("/assets"),
+
+  getAtRisk: () => get<any>("/assets/at-risk"),
+
+  getStatus: () => get<any>("/agents/status"),
+
+  create: (data: any) => post<any>("/assets", data),
+
+  update: (id: number, data: any) => patch<any>(`/assets/${id}`, data),
 };
 
 // ── LLM — Explication des vulnérabilités SAST / DAST ─────────
@@ -454,8 +470,8 @@ export const cicdAPI = {
 
   submitResults: (data: any) => post<any>("/cicd/submit-results", data),
 };
-// ── Reports LLM — Rapports narratifs CyberSentinel ───────────
 
+// ── Reports LLM — Rapports narratifs CyberSentinel ───────────
 export type LLMReportType =
   | "security_summary"
   | "incident_analysis"
@@ -511,6 +527,7 @@ export const reportsAPI = {
 
   getTypes: () => get<LLMReportTypesResponse>("/reports/types"),
 };
+
 // ── Health ───────────────────────────────────────────────────
 export const healthAPI = {
   check: async () => {
@@ -522,6 +539,7 @@ export const healthAPI = {
     return res.json();
   },
 };
+
 // ============================================================
 // M11 — HIDS / Wazuh API
 // ============================================================
@@ -529,8 +547,7 @@ export const healthAPI = {
 export const hidsAPI = {
   getStats: () => get<any>("/hids/stats"),
 
-  getAlerts: (limit = 50) =>
-    get<any>(`/hids/alerts?limit=${limit}`),
+  getAlerts: (limit = 50) => get<any>(`/hids/alerts?limit=${limit}`),
 
   getAgentStatus: (name = "ai-learn") =>
     get<any>(`/hids/agent/status?name=${encodeURIComponent(name)}`),

@@ -5,7 +5,7 @@
 
 from typing import Optional
 
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, func
 
 from app.core.database import AsyncSessionLocal
 from app.models.asset import Asset
@@ -26,7 +26,7 @@ class AssetResolver:
                 conditions.append(Asset.ip_address == ip)
 
             if hostname:
-                conditions.append(Asset.hostname == hostname)
+                conditions.append(func.lower(Asset.hostname) == hostname.lower())
 
             result = await db.execute(
                 select(Asset)

@@ -20,6 +20,9 @@ const PurpleTeam = lazy(() => import("./pages/PurpleTeam"));
 const Reports = lazy(() => import("./pages/Reports"));
 const Admin = lazy(() => import("./pages/Admin"));
 
+// M12 — Asset Registry / Agents Heartbeat
+const AssetRegistry = lazy(() => import("./pages/AssetRegistry"));
+
 // Pages cibles utilisées par CodeScan
 const SASTPage = lazy(() => import("./pages/SASTScanner"));
 const DASTPage = lazy(() => import("./pages/DASTSandbox"));
@@ -70,6 +73,9 @@ export default function App() {
               <Route path="/purple" element={<PurpleTeam />} />
               <Route path="/reports" element={<Reports />} />
               <Route path="/admin" element={<Admin />} />
+
+              {/* M12 — Asset Registry / Agents Heartbeat */}
+              <Route path="/assets" element={<AssetRegistry />} />
 
               {/* Pages cibles utilisées par CodeScan */}
               <Route path="/sast" element={<SASTPage />} />

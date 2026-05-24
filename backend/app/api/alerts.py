@@ -2,17 +2,20 @@
 # M1 — API REST Alertes
 # FIXES :
 #   [D] Ajout endpoint DELETE /alerts/cache/clear
-#   [B] fusion_case stocké en int dans Redis (pas string)
+#   [B] fusion_case stocké en int dans Redis
+#   [M12] Ajout asset_ip / asset_name / asset_criticality
+#   [M12] Ajout agent_ip / agent_hostname depuis raw_payload
+#   [M12] Filtres par machine : asset_ip, agent_ip, hostname
 # ============================================================
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 import json
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func
+from sqlalchemy import select, desc, func, or_
 import redis.asyncio as aioredis
 
 from app.core.database import get_db
@@ -35,114 +38,181 @@ class AlertIn(BaseModel):
     category: Optional[str] = None
     source: str = "suricata"
 
+    # M12 — champs optionnels pour ingestion distante
+    asset_ip: Optional[str] = None
+    asset_name: Optional[str] = None
+    asset_criticality: Optional[float] = None
+    agent_ip: Optional[str] = None
+    agent_hostname: Optional[str] = None
+
 
 def normalize_severity(severity: str) -> str:
     sev = (severity or "MOYEN").upper()
     mapping = {
-        "CRITICAL":      "CRITIQUE",
-        "HIGH":          "ELEVE",
-        "MEDIUM":        "MOYEN",
-        "LOW":           "FAIBLE",
-        "INFO":          "FAIBLE",
+        "CRITICAL": "CRITIQUE",
+        "HIGH": "ELEVE",
+        "MEDIUM": "MOYEN",
+        "LOW": "FAIBLE",
+        "INFO": "FAIBLE",
         "INFORMATIONAL": "FAIBLE",
-        "CRITIQUE":      "CRITIQUE",
-        "ELEVE":         "ELEVE",
-        "ÉLEVÉ":         "ELEVE",
-        "MOYEN":         "MOYEN",
-        "FAIBLE":        "FAIBLE",
+        "CRITIQUE": "CRITIQUE",
+        "ELEVE": "ELEVE",
+        "ÉLEVÉ": "ELEVE",
+        "MOYEN": "MOYEN",
+        "FAIBLE": "FAIBLE",
     }
     return mapping.get(sev, "MOYEN")
 
 
 # [B] Normalise fusion_case : string → int
-# Problème : fusion_service.py publie parfois "SIGNATURE_ONLY"
-# au lieu du numéro de cas, ce qui cassait l'affichage frontend
 FUSION_CASE_STRING_MAP = {
     "SIGNATURE_ML_FLUX": 1,
-    "SIGNATURE_ML_5S":   2,
-    "SIGNATURE_ONLY":    3,
-    "ML_ONLY":           4,
-    "BRUIT":             5,
-    "NOISE":             5,
+    "SIGNATURE_ML_5S": 2,
+    "SIGNATURE_ONLY": 3,
+    "ML_ONLY": 4,
+    "BRUIT": 5,
+    "NOISE": 5,
 }
+
 
 def normalize_fusion_case(raw) -> Optional[int]:
     """Convertit fusion_case string ou int → int 1-5."""
     if raw is None:
         return None
+
     if isinstance(raw, int):
         return raw
+
     if isinstance(raw, str):
         from_map = FUSION_CASE_STRING_MAP.get(raw.upper())
         if from_map:
             return from_map
+
         try:
             return int(raw)
         except ValueError:
             return None
+
     return None
 
 
 @router.post("/ingest")
 async def ingest_alert(alert: AlertIn):
     """
-    Reçoit une alerte externe depuis Suricata GNS3.
+    Reçoit une alerte externe depuis Suricata/GNS3.
     Stockage rapide dans Redis pour affichage dashboard temps réel.
     """
     now = datetime.now(timezone.utc)
     signature = alert.signature_name or alert.title or "Suricata Alert"
 
-    data = {
-        "id":             int(now.timestamp() * 1000),
-        "source":         alert.source,
-        "severity":       normalize_severity(alert.severity),
-        "src_ip":         alert.src_ip,
-        "dest_ip":        alert.dest_ip,
-        "src_port":       alert.src_port,
-        "dest_port":      alert.dest_port,
-        "protocol":       alert.protocol,
-        "signature_id":   None,
-        "signature_name": signature,
-        "title":          signature,
-        "category":       alert.category,
-        "suricata_score": 1.0,
-        "ml_score":       0.0,
-        "confidence":     0.7,
-        # [B] FIX : stocker en int, pas en string "SIGNATURE_ONLY"
-        "fusion_case":    3,
-        "technique_id":   None,
-        "technique_name": None,
-        "tactic":         None,
-        "apt_groups":     [],
-        "detected_at":    now.isoformat(),
+    raw_payload = {
+        "agent_ip": alert.agent_ip,
+        "agent_hostname": alert.agent_hostname,
+        "asset_ip": alert.asset_ip,
+        "asset_name": alert.asset_name,
     }
 
-    r = await aioredis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
+    data = {
+        "id": int(now.timestamp() * 1000),
+        "source": alert.source,
+        "severity": normalize_severity(alert.severity),
+
+        "src_ip": alert.src_ip,
+        "dest_ip": alert.dest_ip,
+        "src_port": alert.src_port,
+        "dest_port": alert.dest_port,
+        "protocol": alert.protocol,
+
+        "signature_id": None,
+        "signature_name": signature,
+        "title": signature,
+        "category": alert.category,
+
+        "suricata_score": 1.0,
+        "ml_score": 0.0,
+        "confidence": 0.7,
+
+        # [B] FIX : int
+        "fusion_case": 3,
+
+        "technique_id": None,
+        "technique_name": None,
+        "tactic": None,
+        "apt_groups": [],
+
+        # M12 — machine / asset
+        "asset_ip": alert.asset_ip,
+        "asset_name": alert.asset_name,
+        "asset_criticality": alert.asset_criticality,
+        "agent_ip": alert.agent_ip,
+        "agent_hostname": alert.agent_hostname,
+        "raw_payload": raw_payload,
+
+        "detected_at": now.isoformat(),
+    }
+
+    r = await aioredis.from_url(
+        settings.REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+    )
+
     try:
         await r.zadd("alerts:recent", {json.dumps(data): now.timestamp()})
         await r.zremrangebyrank("alerts:recent", 0, -501)
     finally:
         await r.aclose()
 
-    return {"status": "ok", "message": "alert ingested", "alert": data}
+    return {
+        "status": "ok",
+        "message": "alert ingested",
+        "alert": data,
+    }
 
 
 @router.get("/recent")
 async def get_recent_alerts(limit: int = 20):
     """Récupère les alertes récentes depuis Redis."""
-    r = await aioredis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
+    r = await aioredis.from_url(
+        settings.REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+    )
+
     try:
         raw = await r.zrevrange("alerts:recent", 0, limit - 1)
         alerts = []
+
         for item in raw:
             try:
                 a = json.loads(item)
+
                 # [B] Normaliser fusion_case à la lecture aussi
                 a["fusion_case"] = normalize_fusion_case(a.get("fusion_case"))
+
+                # M12 — garantir les champs attendus par le frontend
+                raw_payload = a.get("raw_payload") or {}
+
+                a["asset_ip"] = a.get("asset_ip") or raw_payload.get("asset_ip")
+                a["asset_name"] = a.get("asset_name") or raw_payload.get("asset_name")
+                a["asset_criticality"] = a.get("asset_criticality")
+
+                a["agent_ip"] = a.get("agent_ip") or raw_payload.get("agent_ip")
+                a["agent_hostname"] = (
+                    a.get("agent_hostname")
+                    or raw_payload.get("agent_hostname")
+                )
+
                 alerts.append(a)
+
             except json.JSONDecodeError:
                 continue
-        return {"total": len(alerts), "alerts": alerts}
+
+        return {
+            "total": len(alerts),
+            "alerts": alerts,
+        }
+
     finally:
         await r.aclose()
 
@@ -151,14 +221,18 @@ async def get_recent_alerts(limit: int = 20):
 async def clear_alerts_cache():
     """
     [D] Vide le cache Redis des alertes récentes.
-    Utile en dev pour repartir propre sans anciennes alertes
-    qui s'affichent comme nouvelles au redémarrage.
+    Utile en dev pour repartir propre.
     """
-    r = await aioredis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
+    r = await aioredis.from_url(
+        settings.REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+    )
+
     try:
         deleted = await r.delete("alerts:recent")
         return {
-            "status":  "ok",
+            "status": "ok",
             "message": "Cache Redis vidé",
             "deleted": bool(deleted),
         }
@@ -171,20 +245,64 @@ async def get_alerts(
     severity: Optional[SeverityLevel] = None,
     limit: int = Query(default=50, le=500),
     offset: int = 0,
-    db: AsyncSession = Depends(get_db)
+
+    # M12 — filtres machine
+    asset_ip: Optional[str] = None,
+    agent_ip: Optional[str] = None,
+    hostname: Optional[str] = None,
+
+    db: AsyncSession = Depends(get_db),
 ):
-    """Récupère les alertes depuis PostgreSQL avec filtres optionnels."""
+    """
+    Récupère les alertes depuis PostgreSQL avec filtres optionnels.
+
+    Exemples :
+    /api/alerts/?asset_ip=10.16.2.150
+    /api/alerts/?agent_ip=10.16.2.157
+    /api/alerts/?hostname=ai-learn
+    """
     query = select(Alert).order_by(desc(Alert.detected_at))
 
     if severity:
         query = query.where(Alert.severity == severity)
 
+    if asset_ip:
+        query = query.where(
+            or_(
+                Alert.asset_ip == asset_ip,
+                Alert.src_ip == asset_ip,
+                Alert.dest_ip == asset_ip,
+            )
+        )
+
+    if agent_ip:
+        query = query.where(
+            or_(
+                Alert.asset_ip == agent_ip,
+                Alert.src_ip == agent_ip,
+                Alert.dest_ip == agent_ip,
+            )
+        )
+
+    if hostname:
+        query = query.where(
+            or_(
+                Alert.asset_name == hostname,
+                Alert.raw_payload["agent_hostname"].as_string() == hostname,
+                Alert.raw_payload["hostname"].as_string() == hostname,
+            )
+        )
+
+    total_query = select(func.count()).select_from(query.subquery())
+    total = await db.scalar(total_query)
+
     query = query.offset(offset).limit(limit)
+
     result = await db.execute(query)
     alerts = result.scalars().all()
 
     return {
-        "total":  len(alerts),
+        "total": total or 0,
         "alerts": [_alert_to_dict(a) for a in alerts],
     }
 
@@ -195,6 +313,7 @@ async def get_alert_stats(db: AsyncSession = Depends(get_db)):
     total = await db.scalar(select(func.count(Alert.id)))
 
     counts = {}
+
     for sev in SeverityLevel:
         count = await db.scalar(
             select(func.count(Alert.id)).where(Alert.severity == sev)
@@ -202,11 +321,16 @@ async def get_alert_stats(db: AsyncSession = Depends(get_db)):
         counts[sev.value] = count
 
     return {
-        "total":          total,
-        "by_severity":    counts,
+        "total": total or 0,
+        "by_severity": counts,
         "detection_rate": round(
-            (counts.get("CRITIQUE", 0) + counts.get("ELEVE", 0)) / max(total, 1) * 100,
-            1
+            (
+                counts.get("CRITIQUE", 0)
+                + counts.get("ELEVE", 0)
+            )
+            / max(total or 0, 1)
+            * 100,
+            1,
         ),
     }
 
@@ -224,28 +348,70 @@ async def get_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
 
 
 def _alert_to_dict(alert: Alert) -> dict:
+    raw_payload = alert.raw_payload or {}
+
+    agent_ip = (
+        raw_payload.get("agent_ip")
+        or raw_payload.get("host_ip")
+        or raw_payload.get("ip")
+    )
+
+    agent_hostname = (
+        raw_payload.get("agent_hostname")
+        or raw_payload.get("hostname")
+        or raw_payload.get("host")
+    )
+
     return {
-        "id":             alert.id,
-        "source":         alert.source.value if alert.source else None,
-        "severity":       alert.severity.value if alert.severity else None,
-        "src_ip":         alert.src_ip,
-        "dest_ip":        alert.dest_ip,
-        "src_port":       alert.src_port,
-        "dest_port":      alert.dest_port,
-        "protocol":       alert.protocol,
-        "signature_id":   alert.signature_id,
+        "id": alert.id,
+
+        "source": alert.source.value if alert.source else None,
+        "severity": alert.severity.value if alert.severity else None,
+
+        "src_ip": alert.src_ip,
+        "dest_ip": alert.dest_ip,
+        "src_port": alert.src_port,
+        "dest_port": alert.dest_port,
+        "protocol": alert.protocol,
+
+        "signature_id": alert.signature_id,
         "signature_name": alert.signature_name,
-        "category":       alert.category,
+        "category": alert.category,
+
         "suricata_score": alert.suricata_score,
-        "attack_type":    alert.attack_type,
-        "attack_type":    alert.attack_type,
-        "ml_score":       alert.ml_score,
-        "confidence":     alert.confidence,
+        "attack_type": alert.attack_type,
+
+        "ml_score": alert.ml_score,
+        "confidence": alert.confidence,
+
         # [B] FIX : normaliser fusion_case depuis la DB aussi
-        "fusion_case":    normalize_fusion_case(alert.fusion_case),
-        "technique_id":   alert.technique_id,
+        "fusion_case": normalize_fusion_case(alert.fusion_case),
+
+        "technique_id": alert.technique_id,
         "technique_name": alert.technique_name,
-        "tactic":         alert.tactic,
-        "apt_groups":     alert.apt_groups or [],
-        "detected_at":    alert.detected_at.isoformat() if alert.detected_at else None,
+        "tactic": alert.tactic,
+        "apt_groups": alert.apt_groups or [],
+
+        # M12 — Asset Registry
+        "asset_ip": getattr(alert, "asset_ip", None),
+        "asset_name": getattr(alert, "asset_name", None),
+        "asset_criticality": getattr(alert, "asset_criticality", None),
+
+        # M12 — Agent émetteur depuis raw_payload
+        "agent_ip": agent_ip,
+        "agent_hostname": agent_hostname,
+
+        # Payload brut utile pour filtrage frontend par machine
+        "raw_payload": raw_payload,
+
+        "detected_at": (
+            alert.detected_at.isoformat()
+            if alert.detected_at
+            else None
+        ),
+        "created_at": (
+            alert.created_at.isoformat()
+            if alert.created_at
+            else None
+        ),
     }

@@ -1,20 +1,30 @@
 # ============================================================
 # M12 — API Asset Registry
 # Gestion des machines surveillées + heartbeat agents
+# + Ingestion distante Suricata via Fluent Bit
 # ============================================================
 
+import asyncio
+import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.asset import Asset
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# Schemas Pydantic
+# ============================================================
 
 class AssetCreate(BaseModel):
     hostname: str
@@ -63,6 +73,10 @@ def serialize_asset(asset: Asset) -> Dict[str, Any]:
     }
 
 
+# ============================================================
+# GET /api/assets
+# ============================================================
+
 @router.get("/assets")
 async def get_assets():
     async with AsyncSessionLocal() as db:
@@ -76,6 +90,10 @@ async def get_assets():
             "assets": [serialize_asset(a) for a in assets],
         }
 
+
+# ============================================================
+# POST /api/assets
+# ============================================================
 
 @router.post("/assets")
 async def create_asset(payload: AssetCreate):
@@ -112,6 +130,10 @@ async def create_asset(payload: AssetCreate):
         }
 
 
+# ============================================================
+# PATCH /api/assets/{asset_id}
+# ============================================================
+
 @router.patch("/assets/{asset_id}")
 async def update_asset(asset_id: int, payload: AssetUpdate):
     async with AsyncSessionLocal() as db:
@@ -140,6 +162,10 @@ async def update_asset(asset_id: int, payload: AssetUpdate):
         }
 
 
+# ============================================================
+# GET /api/assets/at-risk
+# ============================================================
+
 @router.get("/assets/at-risk")
 async def get_assets_at_risk():
     async with AsyncSessionLocal() as db:
@@ -159,6 +185,10 @@ async def get_assets_at_risk():
             "assets": [serialize_asset(a) for a in assets],
         }
 
+
+# ============================================================
+# POST /api/agents/heartbeat
+# ============================================================
 
 @router.post("/agents/heartbeat")
 async def agent_heartbeat(payload: HeartbeatPayload):
@@ -198,6 +228,10 @@ async def agent_heartbeat(payload: HeartbeatPayload):
         }
 
 
+# ============================================================
+# GET /api/agents/status
+# ============================================================
+
 @router.get("/agents/status")
 async def get_agents_status():
     async with AsyncSessionLocal() as db:
@@ -221,3 +255,98 @@ async def get_agents_status():
             },
             "agents": [serialize_asset(a) for a in assets],
         }
+
+
+# ============================================================
+# POST /api/agents/events
+# Ingestion distante des alertes Suricata via Fluent Bit
+# Format attendu : json_lines / NDJSON
+# ============================================================
+
+@router.post("/agents/events")
+async def ingest_agent_events(request: Request):
+    auth = request.headers.get("Authorization", "")
+    expected_token = f"Bearer {settings.AGENT_INGEST_TOKEN}"
+
+    if not settings.AGENT_INGEST_TOKEN or settings.AGENT_INGEST_TOKEN == "change_me":
+        raise HTTPException(
+            status_code=500,
+            detail="AGENT_INGEST_TOKEN non configuré côté serveur",
+        )
+
+    if auth != expected_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Token agent invalide",
+        )
+
+    body = await request.body()
+
+    if not body:
+        return {
+            "received": True,
+            "queued": 0,
+            "ignored": 0,
+            "errors": 0,
+        }
+
+    watcher = getattr(request.app.state, "suricata_watcher", None)
+
+    if watcher is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Suricata watcher non disponible",
+        )
+
+    queued = 0
+    ignored = 0
+    errors = 0
+
+    lines = body.decode("utf-8", errors="ignore").strip().splitlines()
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        try:
+            event = json.loads(line)
+
+            if not isinstance(event, dict):
+                ignored += 1
+                continue
+
+            # Fluent Bit peut parfois encapsuler l'événement dans "log".
+            if "log" in event and isinstance(event["log"], str):
+                try:
+                    nested = json.loads(event["log"])
+                    if isinstance(nested, dict):
+                        event = nested
+                except Exception:
+                    pass
+
+            # On accepte uniquement les alertes Suricata.
+            if event.get("event_type") != "alert":
+                ignored += 1
+                continue
+
+            # Traçabilité multi-machine
+            event.setdefault("source", "REMOTE_SURICATA")
+            event.setdefault("agent_hostname", event.get("host") or "unknown-agent")
+            event.setdefault("agent_ip", event.get("agent_ip") or event.get("src_ip"))
+
+            # Ne pas await ici :
+            # l'ingestion HTTP doit répondre rapidement à Fluent Bit.
+            asyncio.create_task(watcher._process_line(json.dumps(event)))
+
+            queued += 1
+
+        except Exception as e:
+            errors += 1
+            logger.warning("Event agent invalide: %s", e, exc_info=True)
+
+    return {
+        "received": True,
+        "queued": queued,
+        "ignored": ignored,
+        "errors": errors,
+    }

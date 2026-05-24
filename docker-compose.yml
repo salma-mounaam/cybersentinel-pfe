@@ -5,12 +5,12 @@
 #   mgmt-net    : canal backend ↔ ZAP
 #   sandbox-net : cibles DAST internal:true — ZERO internet
 #
-# Version corrigée PCAP DAST :
-#   - Volume ./data/dast_captures monté dans ZAP
-#   - Volume ./data/dast_captures monté dans backend/celery
-#   - ZAP utilise l'image cybersentinel-zap:custom avec tcpdump
-#   - Backend peut lire les PCAP générés par ZAP
-#   - ZAP lancé en privileged pour autoriser tcpdump -i any
+# Version corrigée :
+#   - PCAP DAST partagé backend / celery / ZAP
+#   - ZAP custom avec tcpdump
+#   - Backend garde les containers DAST échoués pour debug
+#   - Limitation logs Docker pour éviter saturation disque
+#   - Wazuh sans spam indexer obligatoire
 # ============================================================
 
 services:
@@ -38,6 +38,11 @@ services:
       start_period: 20s
     ports:
       - "5432:5432"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   redis:
     image: redis:7.2-alpine
@@ -56,6 +61,11 @@ services:
       start_period: 10s
     ports:
       - "6379:6379"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   backend:
     build:
@@ -88,6 +98,9 @@ services:
       # PCAP DAST
       PCAP_DIR: /app/data/dast_captures
 
+      # Debug DAST : garder les containers échoués pour lire leurs logs
+      DAST_KEEP_FAILED_CONTAINERS: "true"
+
     volumes:
       - ./backend:/app
       - ./.env:/app/.env:ro
@@ -108,6 +121,7 @@ services:
       # Docker socket pour lancer ZAP / cibles DAST
       - /var/run/docker.sock:/var/run/docker.sock
 
+      # Logs Wazuh lus par M11
       - wazuh_logs:/var/ossec/logs:ro
 
     networks:
@@ -133,6 +147,12 @@ services:
       --reload-exclude /app/data
       --reload-exclude /app/data/uploads_dast
       --reload-exclude /app/data/dast_captures
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
 
   celery_worker:
     build:
@@ -182,6 +202,12 @@ services:
     healthcheck:
       disable: true
 
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
   celery_beat:
     build:
       context: ./backend
@@ -225,6 +251,12 @@ services:
     healthcheck:
       disable: true
 
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
   frontend:
     build:
       context: ./frontend
@@ -246,6 +278,12 @@ services:
       REACT_APP_API_URL: http://localhost:8000/api
       REACT_APP_API_ROOT: http://localhost:8000
       REACT_APP_WS_URL: ws://localhost:8000/ws
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   suricata:
     image: jasonish/suricata:latest
@@ -270,6 +308,12 @@ services:
       --set classification-file=/etc/suricata/classification.config
       --set reference-config-file=/etc/suricata/reference.config
 
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
   zap:
     image: cybersentinel-zap:custom
     container_name: cybersentinel_zap
@@ -291,12 +335,7 @@ services:
         "api.addrs.addr.regex=true"
       ]
 
-    # ========================================================
-    # FIX PCAP :
-    # tcpdump -i any échoue sans privilèges élevés :
-    # "Operation not permitted"
-    # Pour le lab/PFE, privileged:true est la solution la plus fiable.
-    # ========================================================
+    # tcpdump -i any nécessite privilèges élevés
     privileged: true
 
     cap_add:
@@ -308,7 +347,6 @@ services:
       - apparmor:unconfined
 
     volumes:
-      # Volume crucial : ZAP écrit ici les PCAP
       - ./data/dast_captures:/shared/dast_captures
 
     networks:
@@ -332,6 +370,12 @@ services:
       retries: 5
       start_period: 30s
 
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
   webgoat:
     image: webgoat/webgoat:latest
     container_name: cybersentinel_webgoat
@@ -350,6 +394,12 @@ services:
       retries: 8
       start_period: 60s
 
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   dvwa:
     image: vulnerables/web-dvwa:latest
     container_name: cybersentinel_dvwa
@@ -360,6 +410,12 @@ services:
 
     profiles:
       - dast
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   wazuh-manager:
     image: wazuh/wazuh-manager:4.14.5
@@ -372,10 +428,12 @@ services:
       - "1515:1515/tcp"
       - "55000:55000/tcp"
 
+    # CyberSentinel consomme directement :
+    # /var/ossec/logs/alerts/alerts.json
+    #
+    # On évite INDEXER_URL=https://wazuh-indexer:9200
+    # si le conteneur wazuh-indexer n'existe pas, sinon Filebeat spamme les logs.
     environment:
-      - INDEXER_URL=https://wazuh-indexer:9200
-      - INDEXER_USERNAME=admin
-      - INDEXER_PASSWORD=SecretPassword
       - FILEBEAT_SSL_VERIFICATION_MODE=none
 
     volumes:
@@ -388,6 +446,14 @@ services:
 
     networks:
       - main-net
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+
 networks:
   main-net:
     name: cybersentinel_main-net

@@ -7,32 +7,59 @@
 //   [D] Bouton "Vider le cache" pour repartir propre en dev
 //   [E] Stats : lire depuis Redis (recent) si PostgreSQL vide
 //   [F] Métriques ML : données réelles depuis /api/ml/loao-results
+//   [G] Pas de données aléatoires dans les graphiques
+//   [H] ROC/LOAO basée sur by_attack réel, pas courbe artificielle
+//   [I] Cartes modèles clarifiées : métriques = ensemble, pas modèle individuel
+//   [J] Déduplication silencieuse du flux : une seule ligne par attaque logique
 // ============================================================
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
-  Activity, BrainCircuit, Shield, Zap,
-  Filter, Download, Pause, Play, Wifi, WifiOff, Trash2,
-} from 'lucide-react';
-import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
-import { Button } from '../components/ui/button';
-import { Badge } from '../components/ui/badge';
-import { Switch } from '../components/ui/switch';
-import { cn } from '../lib/utils';
+  Activity,
+  BrainCircuit,
+  Shield,
+  Zap,
+  Filter,
+  Download,
+  Pause,
+  Play,
+  Wifi,
+  WifiOff,
+  Trash2,
+} from "lucide-react";
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ScatterChart, Scatter, ZAxis,
-  ReferenceLine, BarChart, Bar, Cell,
-} from 'recharts';
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "../components/ui/card";
+import { Button } from "../components/ui/button";
+import { Badge } from "../components/ui/badge";
+import { Switch } from "../components/ui/switch";
+import { cn } from "../lib/utils";
+import {
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ScatterChart,
+  Scatter,
+  ZAxis,
+  ReferenceLine,
+  BarChart,
+  Bar,
+  Cell,
+} from "recharts";
 // [F] Ajout mlAPI
-import { alertsAPI, fusionAPI, mlAPI } from '../services/api';
-import { useWebSocket } from '../hooks/useWebSocket';
+import { alertsAPI, fusionAPI, mlAPI } from "../services/api";
+import { useWebSocket } from "../hooks/useWebSocket";
 
 // ── Types ─────────────────────────────────────────────────────
 interface LiveAlert {
   id: string;
   timestamp: Date;
-  severity: 'CRITIQUE' | 'ELEVE' | 'MOYEN' | 'FAIBLE';
+  severity: "CRITIQUE" | "ELEVE" | "MOYEN" | "FAIBLE";
   signature_name: string;
   src_ip: string;
   dest_ip: string;
@@ -41,30 +68,31 @@ interface LiveAlert {
   ml_score: number;
   technique_id: string | null;
   attack_type: string | null;
-  _source: 'cache' | 'live';
+  dedup_key: string;
+  _source: "cache" | "live";
 }
 
 // ── Helpers ───────────────────────────────────────────────────
 const SEV_BG: Record<string, string> = {
-  CRITIQUE: 'bg-red-500/10 text-red-400 border-red-500/30',
-  ELEVE:    'bg-amber-500/10 text-amber-400 border-amber-500/30',
-  MOYEN:    'bg-blue-500/10 text-blue-400 border-blue-500/30',
-  FAIBLE:   'bg-green-500/10 text-green-400 border-green-500/30',
+  CRITIQUE: "bg-red-500/10 text-red-400 border-red-500/30",
+  ELEVE: "bg-amber-500/10 text-amber-400 border-amber-500/30",
+  MOYEN: "bg-blue-500/10 text-blue-400 border-blue-500/30",
+  FAIBLE: "bg-green-500/10 text-green-400 border-green-500/30",
 };
 
 const FUSION_CASE_MAP: Record<string, number> = {
-  'SIGNATURE_ONLY':    3,
-  'ML_ONLY':           4,
-  'SIGNATURE_ML_FLUX': 1,
-  'SIGNATURE_ML_5S':   2,
-  'BRUIT':             5,
-  'NOISE':             5,
+  SIGNATURE_ONLY: 3,
+  ML_ONLY: 4,
+  SIGNATURE_ML_FLUX: 1,
+  SIGNATURE_ML_5S: 2,
+  BRUIT: 5,
+  NOISE: 5,
 };
 
 function normalizeFusionCase(raw: any): number | null {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw === 'number') return raw;
-  if (typeof raw === 'string') {
+  if (typeof raw === "number") return raw;
+  if (typeof raw === "string") {
     const fromMap = FUSION_CASE_MAP[raw.toUpperCase()];
     if (fromMap) return fromMap;
     const parsed = parseInt(raw, 10);
@@ -74,46 +102,270 @@ function normalizeFusionCase(raw: any): number | null {
 }
 
 const FUSION_LABEL: Record<number, string> = {
-  1: 'Sig+ML+Flux', 2: 'Sig+ML+5s', 3: 'Sig seule', 4: 'ML seul', 5: 'Bruit',
+  1: "Sig+ML+Flux",
+  2: "Sig+ML+5s",
+  3: "Sig seule",
+  4: "ML seul",
+  5: "Bruit",
 };
 const FUSION_COLOR: Record<number, string> = {
-  1: '#22c55e', 2: '#14b8a6', 3: '#3b82f6', 4: '#8b5cf6', 5: '#4a5568',
+  1: "#22c55e",
+  2: "#14b8a6",
+  3: "#3b82f6",
+  4: "#8b5cf6",
+  5: "#4a5568",
 };
 
 function parseAlertTimestamp(raw?: string): Date {
   if (!raw) return new Date();
+
   try {
-    const d = new Date(raw);
+    let normalized = String(raw).trim();
+
+    // Suricata/PostgreSQL peuvent produire +0000 au lieu de +00:00.
+    normalized = normalized.replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+
+    // Si aucune timezone explicite n'est présente, on considère UTC.
+    // Exemple : 2026-05-19T14:11:01.745995 → 2026-05-19T14:11:01.745995Z
+    const hasTimezone = /Z$|[+-]\d{2}:?\d{2}$/.test(normalized);
+    if (!hasTimezone) normalized = `${normalized}Z`;
+
+    const d = new Date(normalized);
     return isNaN(d.getTime()) ? new Date() : d;
   } catch {
     return new Date();
   }
 }
 
+function normalizeText(value?: string | null): string {
+  const v = String(value || "").trim();
+  return v || "Unknown";
+}
+
+function normalizeIp(value?: string | null): string {
+  const v = String(value || "").trim();
+  if (!v || v === "—" || v === "0.00" || v === "0.0.0.0") return "unknown";
+  return v;
+}
+
+function getAlertTimeMs(alert: Pick<LiveAlert, "timestamp"> | any): number {
+  const raw =
+    alert?.timestamp instanceof Date
+      ? alert.timestamp.getTime()
+      : new Date(
+          alert?.detected_at ||
+            alert?.timestamp ||
+            alert?.created_at ||
+            Date.now(),
+        ).getTime();
+
+  return Number.isNaN(raw) ? Date.now() : raw;
+}
+
+function getPrimaryAttackType(alert: any): string {
+  const raw =
+    alert.attack_type ||
+    alert.llm_attack_type ||
+    alert.title?.split("—")?.[0] ||
+    alert.signature_name ||
+    "Unknown";
+
+  const value = normalizeText(raw);
+
+  // Normalisation légère pour éviter Port Scan / PortScan / portscan
+  const aliases: Record<string, string> = {
+    "port scan": "PortScan",
+    portscan: "PortScan",
+    "brute force": "BruteForce",
+    bruteforce: "BruteForce",
+    "sql injection": "SQLi",
+    sqli: "SQLi",
+    "command injection": "CommandInjection",
+    "file integrity": "FileIntegrity",
+    fim: "FileIntegrity",
+    "authentication failure": "AuthenticationFailure",
+    authfailure: "AuthenticationFailure",
+    "docker abuse": "DockerAbuse",
+    unknown: "Unknown",
+  };
+
+  return aliases[value.toLowerCase()] || value;
+}
+
+function getSeverityRank(severity?: string | null): number {
+  const s = String(severity || "").toUpperCase();
+  if (s.includes("CRITIQUE") || s.includes("CRITICAL")) return 4;
+  if (s.includes("ELEVE") || s.includes("HIGH")) return 3;
+  if (s.includes("MOYEN") || s.includes("MEDIUM")) return 2;
+  if (s.includes("FAIBLE") || s.includes("LOW")) return 1;
+  return 0;
+}
+
+function isFusedAlert(alert: any): boolean {
+  const fusionCase = normalizeFusionCase(alert?.fusion_case);
+  const fusionLabel = String(alert?.fusion_label || alert?.fusion || "").toLowerCase();
+
+  return (
+    fusionCase === 1 ||
+    fusionCase === 2 ||
+    fusionCase === 4 ||
+    fusionLabel.includes("sig+ml") ||
+    fusionLabel.includes("fusion")
+  );
+}
+
+function buildAlertDedupKey(alert: any): string {
+  const attackType = getPrimaryAttackType(alert).toLowerCase();
+  const srcIp = normalizeIp(alert.src_ip || alert.source_ip || alert.srcIp);
+
+  // Important : on n'utilise pas signature_id/signature_name dans la clé.
+  // Une même attaque peut arriver en alerte brute puis en alerte fusionnée M3
+  // avec une signature ou un libellé différent.
+  // On garde attack_type pour ne pas mélanger WebAttack et CommandInjection.
+  const technique = String(
+    alert.technique_id ||
+      alert.mitre_technique_id ||
+      alert.mitre_id ||
+      alert.technique ||
+      "no-technique",
+  ).trim();
+
+  // Fenêtre de regroupement visuel : 60 secondes.
+  const minuteBucket = Math.floor(getAlertTimeMs(alert) / 60000);
+
+  return `${attackType}|${srcIp}|${technique}|${minuteBucket}`;
+}
+
+function chooseBestAlert(existing: LiveAlert, incoming: LiveAlert): LiveAlert {
+  const existingFused = isFusedAlert(existing);
+  const incomingFused = isFusedAlert(incoming);
+
+  if (incomingFused && !existingFused) return incoming;
+  if (!incomingFused && existingFused) return existing;
+
+  const existingSeverity = getSeverityRank(existing.severity);
+  const incomingSeverity = getSeverityRank(incoming.severity);
+
+  if (incomingSeverity > existingSeverity) return incoming;
+  if (incomingSeverity < existingSeverity) return existing;
+
+  const existingScore = Number(existing.confidence || existing.ml_score || 0);
+  const incomingScore = Number(incoming.confidence || incoming.ml_score || 0);
+
+  if (incomingScore > existingScore) return incoming;
+  if (incomingScore < existingScore) return existing;
+
+  return getAlertTimeMs(incoming) >= getAlertTimeMs(existing)
+    ? incoming
+    : existing;
+}
+
+function deduplicateAlerts(alerts: LiveAlert[]): LiveAlert[] {
+  const map = new Map<string, LiveAlert>();
+
+  for (const alert of alerts || []) {
+    const key = alert.dedup_key || buildAlertDedupKey(alert);
+    const normalizedAlert = { ...alert, dedup_key: key };
+    const existing = map.get(key);
+
+    if (!existing) {
+      map.set(key, normalizedAlert);
+      continue;
+    }
+
+    const best = chooseBestAlert(existing, normalizedAlert);
+
+    // Déduplication silencieuse : aucun compteur x2/x3 affiché.
+    // On garde seulement la meilleure version : fusionnée > sévérité > score > récente.
+    map.set(key, {
+      ...existing,
+      ...best,
+      dedup_key: key,
+      _source:
+        existing._source === "live" || normalizedAlert._source === "live"
+          ? "live"
+          : "cache",
+    });
+  }
+
+  return Array.from(map.values()).sort(
+    (a, b) => getAlertTimeMs(b) - getAlertTimeMs(a),
+  );
+}
+
+function toPercentMetric(value: any): number | null {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (Number.isNaN(n)) return null;
+  return n > 1 ? n / 100 : n;
+}
+
+function getAttackMetricValue(data: any, keys: string[]): number {
+  for (const key of keys) {
+    const value = toPercentMetric(data?.[key]);
+    if (value !== null) return value;
+  }
+  return 0;
+}
+
+function getAttackLabel(label: string): string {
+  return label
+    .replace("Web Attack – ", "")
+    .replace("Web Attack - ", "")
+    .replace("DoS ", "")
+    .replace("-Patator", "")
+    .slice(0, 26);
+}
+
 // ── StatCard ──────────────────────────────────────────────────
 function StatCard({
-  title, value, subtitle, icon, color,
+  title,
+  value,
+  subtitle,
+  icon,
+  color,
 }: {
-  title: string; value: number | string; subtitle: string;
-  icon: React.ReactNode; color: 'blue' | 'violet' | 'orange' | 'green';
+  title: string;
+  value: number | string;
+  subtitle: string;
+  icon: React.ReactNode;
+  color: "blue" | "violet" | "orange" | "green";
 }) {
   const colors = {
-    blue:   { text: 'text-blue-400',   bg: 'bg-blue-500/10',   border: 'border-blue-500/20'   },
-    violet: { text: 'text-violet-400', bg: 'bg-violet-500/10', border: 'border-violet-500/20' },
-    orange: { text: 'text-orange-400', bg: 'bg-orange-500/10', border: 'border-orange-500/20' },
-    green:  { text: 'text-green-400',  bg: 'bg-green-500/10',  border: 'border-green-500/20'  },
+    blue: {
+      text: "text-blue-400",
+      bg: "bg-blue-500/10",
+      border: "border-blue-500/20",
+    },
+    violet: {
+      text: "text-violet-400",
+      bg: "bg-violet-500/10",
+      border: "border-violet-500/20",
+    },
+    orange: {
+      text: "text-orange-400",
+      bg: "bg-orange-500/10",
+      border: "border-orange-500/20",
+    },
+    green: {
+      text: "text-green-400",
+      bg: "bg-green-500/10",
+      border: "border-green-500/20",
+    },
   };
   const c = colors[color];
   return (
-    <Card className={cn('bg-card/50 border-cyber-border', c.border)}>
+    <Card className={cn("bg-card/50 border-cyber-border", c.border)}>
       <CardContent className="p-4">
         <div className="flex items-start justify-between">
           <div>
             <p className="text-xs text-muted-foreground mb-1">{title}</p>
-            <p className={cn('text-2xl font-bold font-mono', c.text)}>{value}</p>
+            <p className={cn("text-2xl font-bold font-mono", c.text)}>
+              {value}
+            </p>
             <p className="text-xs text-muted-foreground mt-1">{subtitle}</p>
           </div>
-          <div className={cn('p-2 rounded-lg', c.bg, c.text)}>{icon}</div>
+          <div className={cn("p-2 rounded-lg", c.bg, c.text)}>{icon}</div>
         </div>
       </CardContent>
     </Card>
@@ -124,23 +376,30 @@ function StatCard({
 function AlertRow({ alert, index }: { alert: LiveAlert; index: number }) {
   const fusionCase = alert.fusion_case;
   return (
-    <div className={cn(
-      'flex items-center gap-3 p-2 rounded-lg text-xs transition-colors',
-      'hover:bg-white/5 border border-transparent hover:border-white/5',
-      index === 0 && 'border-white/8 bg-white/3',
-      alert._source === 'cache' && 'opacity-70',
-    )}>
+    <div
+      className={cn(
+        "flex items-center gap-3 p-2 rounded-lg text-xs transition-colors",
+        "hover:bg-white/5 border border-transparent hover:border-white/5",
+        index === 0 && "border-white/8 bg-white/3",
+        alert._source === "cache" && "opacity-70",
+      )}
+    >
       <span
         className={cn(
-          'w-1.5 h-1.5 rounded-full shrink-0',
-          alert._source === 'live' ? 'bg-green-400 animate-pulse' : 'bg-slate-500',
+          "w-1.5 h-1.5 rounded-full shrink-0",
+          alert._source === "live"
+            ? "bg-green-400 animate-pulse"
+            : "bg-slate-500",
         )}
-        title={alert._source === 'live' ? 'Alerte live' : 'Cache Redis'}
+        title={alert._source === "live" ? "Alerte live" : "Cache Redis"}
       />
-      <span className={cn(
-        'px-2 py-0.5 rounded-full text-[10px] font-medium border shrink-0',
-        SEV_BG[alert.severity] || 'bg-gray-500/10 text-gray-400 border-gray-500/30',
-      )}>
+      <span
+        className={cn(
+          "px-2 py-0.5 rounded-full text-[10px] font-medium border shrink-0",
+          SEV_BG[alert.severity] ||
+            "bg-gray-500/10 text-gray-400 border-gray-500/30",
+        )}
+      >
         {alert.severity}
       </span>
       {alert.attack_type && (
@@ -149,24 +408,42 @@ function AlertRow({ alert, index }: { alert: LiveAlert; index: number }) {
         </span>
       )}
       <span className="flex-1 truncate text-foreground/80 font-mono">
-        {alert.signature_name || '—'}
+        {alert.signature_name || "—"}
       </span>
-      <span className="text-muted-foreground font-mono hidden md:block">{alert.src_ip || '—'}</span>
+      <span className="text-muted-foreground font-mono hidden md:block">
+        {alert.src_ip || "—"}
+      </span>
       <span className="text-muted-foreground">→</span>
-      <span className="text-muted-foreground font-mono hidden md:block">{alert.dest_ip || '—'}</span>
+      <span className="text-muted-foreground font-mono hidden md:block">
+        {alert.dest_ip || "—"}
+      </span>
       {fusionCase !== null && fusionCase !== undefined && (
-        <span className="text-[10px] font-mono shrink-0" style={{ color: FUSION_COLOR[fusionCase] ?? '#4a5568' }}>
+        <span
+          className="text-[10px] font-mono shrink-0"
+          style={{ color: FUSION_COLOR[fusionCase] ?? "#4a5568" }}
+        >
           {FUSION_LABEL[fusionCase] ?? `Cas ${fusionCase}`}
         </span>
       )}
-      <span className={cn('font-mono shrink-0', alert.confidence > 0.8 ? 'text-red-400' : 'text-muted-foreground')}>
+      <span
+        className={cn(
+          "font-mono shrink-0",
+          alert.confidence > 0.8 ? "text-red-400" : "text-muted-foreground",
+        )}
+      >
         {alert.confidence.toFixed(2)}
       </span>
       {alert.technique_id && (
-        <span className="text-[10px] font-mono text-blue-400 shrink-0">{alert.technique_id}</span>
+        <span className="text-[10px] font-mono text-blue-400 shrink-0">
+          {alert.technique_id}
+        </span>
       )}
       <span className="text-muted-foreground shrink-0">
-        {alert.timestamp.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        {alert.timestamp.toLocaleTimeString("fr-FR", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })}
       </span>
     </div>
   );
@@ -175,40 +452,59 @@ function AlertRow({ alert, index }: { alert: LiveAlert; index: number }) {
 // ── Composant principal ───────────────────────────────────────
 export function IDSMonitor() {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const API_BASE = process.env.REACT_APP_API_URL?.replace(/\/$/, '') || 'http://localhost:8000/api';
+  const API_BASE =
+    process.env.REACT_APP_API_URL?.replace(/\/$/, "") ||
+    "http://localhost:8000/api";
 
-  const [liveAlerts,   setLiveAlerts]   = useState<LiveAlert[]>([]);
-  const [alertStats,   setAlertStats]   = useState<any>(null);
-  const [fusionStats,  setFusionStats]  = useState<any>(null);
+  const [liveAlerts, setLiveAlerts] = useState<LiveAlert[]>([]);
+  const [alertStats, setAlertStats] = useState<any>(null);
+  const [fusionStats, setFusionStats] = useState<any>(null);
   const [scoreHistory, setScoreHistory] = useState<any[]>([]);
-  const [isLive,       setIsLive]       = useState(true);
-  const [fusionEnabled,setFusionEnabled]= useState(true);
-  const [liveCount,    setLiveCount]    = useState(0);
-  const [hasLiveData,  setHasLiveData]  = useState(false);
+  const [isLive, setIsLive] = useState(true);
+  const [fusionEnabled, setFusionEnabled] = useState(true);
+  const [liveCount, setLiveCount] = useState(0);
+  const [hasLiveData, setHasLiveData] = useState(false);
   // [F] State pour les vraies métriques ML
-  const [mlModels,     setMlModels]     = useState<any>(null);
+  const [mlModels, setMlModels] = useState<any>(null);
 
   // [F] Charger les métriques réelles depuis le backend
   useEffect(() => {
-    mlAPI.getLoaoResults()
-      .then(setMlModels)
-      .catch(console.error);
+    mlAPI.getLoaoResults().then(setMlModels).catch(console.error);
   }, []);
 
-  const toLocalAlert = useCallback((a: any, source: 'cache' | 'live'): LiveAlert => ({
-    id:             a.id?.toString() || `${Date.now()}-${Math.random()}`,
-    timestamp:      parseAlertTimestamp(a.detected_at),
-    severity:       a.severity || 'MOYEN',
-    signature_name: a.signature_name || a.title || 'Alerte',
-    src_ip:         a.src_ip || '—',
-    dest_ip:        a.dest_ip || '—',
-    fusion_case:    normalizeFusionCase(a.fusion_case),
-    confidence:     typeof a.confidence === 'number' ? a.confidence : 0,
-    ml_score:       typeof a.ml_score === 'number' ? a.ml_score : 0,
-    technique_id:   a.technique_id || null,
-    attack_type:    a.attack_type || null,
-    _source:        source,
-  }), []);
+  const toLocalAlert = useCallback(
+    (a: any, source: "cache" | "live"): LiveAlert => {
+      const alertLike = {
+        ...a,
+        timestamp: parseAlertTimestamp(
+          a.detected_at || a.timestamp || a.created_at,
+        ),
+      };
+
+      const attackType = getPrimaryAttackType(alertLike);
+      const dedupKey = buildAlertDedupKey({
+        ...alertLike,
+        attack_type: attackType,
+      });
+
+      return {
+        id: a.id?.toString() || dedupKey,
+        timestamp: alertLike.timestamp,
+        severity: a.severity || "MOYEN",
+        signature_name: a.signature_name || a.title || "Alerte",
+        src_ip: a.src_ip || "—",
+        dest_ip: a.dest_ip || a.asset_name || "—",
+        fusion_case: normalizeFusionCase(a.fusion_case),
+        confidence: typeof a.confidence === "number" ? a.confidence : 0,
+        ml_score: typeof a.ml_score === "number" ? a.ml_score : 0,
+        technique_id: a.technique_id || a.mitre_technique_id || null,
+        attack_type: attackType,
+        dedup_key: dedupKey,
+        _source: source,
+      };
+    },
+    [],
+  );
 
   const load = useCallback(async () => {
     try {
@@ -217,23 +513,33 @@ export function IDSMonitor() {
         alertsAPI.getStats(),
         fusionAPI.getStats(),
       ]);
-      const converted: LiveAlert[] = (recent.alerts || []).map((a: any) => toLocalAlert(a, 'cache'));
-      if (!hasLiveData) setLiveAlerts(converted);
+      const converted: LiveAlert[] = (recent.alerts || []).map((a: any) =>
+        toLocalAlert(a, "cache"),
+      );
+      if (!hasLiveData)
+        setLiveAlerts(deduplicateAlerts(converted).slice(0, 50));
       const redisTotal = recent.total ?? converted.length;
       const mergedStats = {
         ...stats,
-        total: (stats?.total > 0) ? stats.total : redisTotal,
+        total: stats?.total > 0 ? stats.total : redisTotal,
         by_severity: stats?.by_severity || {},
       };
       if (!stats?.total || stats.total === 0) {
-        const bySev: Record<string, number> = { CRITIQUE: 0, ELEVE: 0, MOYEN: 0, FAIBLE: 0 };
-        converted.forEach(a => { if (a.severity in bySev) bySev[a.severity]++; });
+        const bySev: Record<string, number> = {
+          CRITIQUE: 0,
+          ELEVE: 0,
+          MOYEN: 0,
+          FAIBLE: 0,
+        };
+        converted.forEach((a) => {
+          if (a.severity in bySev) bySev[a.severity]++;
+        });
         mergedStats.by_severity = bySev;
       }
       setAlertStats(mergedStats);
       setFusionStats(fusion);
     } catch (e) {
-      console.error('IDSMonitor load error:', e);
+      console.error("IDSMonitor load error:", e);
     }
   }, [hasLiveData, toLocalAlert]);
 
@@ -244,30 +550,43 @@ export function IDSMonitor() {
     return () => clearInterval(t);
   }, [load, isLive]);
 
-  const handleWS = useCallback((msg: any) => {
-    if (msg._type === 'connected' || !msg.severity || !isLive) return;
-    setLiveCount(c => c + 1);
-    setHasLiveData(true);
-    const newAlert: LiveAlert = toLocalAlert({ ...msg }, 'live');
-    setLiveAlerts(prev => [newAlert, ...prev].slice(0, 50));
-    setScoreHistory(prev => [
-      ...prev.slice(-29),
-      {
-        t:     newAlert.timestamp.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        if_s:  Math.round((msg.if_score    || msg.ml_score || 0) * 100),
-        ocsvm: Math.round((msg.ocsvm_score || 0) * 100),
-        ae_s:  Math.round((msg.ae_score    || 0) * 100),
-        conf:  Math.round((msg.confidence  || 0) * 100),
-      },
-    ]);
-    if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [isLive, toLocalAlert]);
+  const handleWS = useCallback(
+    (msg: any) => {
+      if (msg._type === "connected" || !msg.severity || !isLive) return;
+      setLiveCount((c) => c + 1);
+      setHasLiveData(true);
+      const newAlert: LiveAlert = toLocalAlert({ ...msg }, "live");
+      setLiveAlerts((prev) =>
+        deduplicateAlerts([newAlert, ...prev]).slice(0, 50),
+      );
+      setScoreHistory((prev) => [
+        ...prev.slice(-29),
+        {
+          t: newAlert.timestamp.toLocaleTimeString("fr-FR", {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }),
+          if_s: Math.round((msg.if_score || msg.ml_score || 0) * 100),
+          ocsvm: Math.round((msg.ocsvm_score || 0) * 100),
+          ae_s: Math.round((msg.ae_score || 0) * 100),
+          conf: Math.round((msg.confidence || 0) * 100),
+        },
+      ]);
+      if (scrollRef.current) scrollRef.current.scrollTop = 0;
+    },
+    [isLive, toLocalAlert],
+  );
 
-  const { connected } = useWebSocket({ channel: 'alerts', onMessage: handleWS, enabled: isLive });
+  const { connected } = useWebSocket({
+    channel: "alerts",
+    onMessage: handleWS,
+    enabled: isLive,
+  });
 
   const handleClearCache = useCallback(async () => {
     try {
-      await fetch(`${API_BASE}/alerts/cache/clear`, { method: 'DELETE' });
+      await fetch(`${API_BASE}/alerts/cache/clear`, { method: "DELETE" });
       setLiveAlerts([]);
       setHasLiveData(false);
       setLiveCount(0);
@@ -277,102 +596,170 @@ export function IDSMonitor() {
     }
   }, [API_BASE]);
 
-  // ── Données graphiques ───────────────────────────────────────
-  const rocData = scoreHistory.length > 5
-    ? scoreHistory.map((s, i) => ({
-        fpr: parseFloat((i / scoreHistory.length * 0.3).toFixed(3)),
-        tpr: parseFloat((Math.min(1, s.conf / 100 + 0.1)).toFixed(3)),
-      }))
-    : Array.from({ length: 20 }, (_, i) => ({
-        fpr: parseFloat((i * 0.05).toFixed(3)),
-        tpr: parseFloat((Math.min(1, i * 0.05 + 0.15)).toFixed(3)),
-      }));
+  // [F] Métriques réelles depuis l'API
+  const realF1 = mlModels?.metrics?.f1_mean ?? null;
+  const realRecall = mlModels?.metrics?.recall_mean ?? null;
+  const realFpr = mlModels?.metrics?.fpr_mean ?? null;
+  const realAuc =
+    mlModels?.metrics?.auc_roc ?? mlModels?.metrics?.mean_auc_roc ?? null;
+  const byAttack = mlModels?.metrics?.by_attack ?? null;
 
-  const scoreDistribution = liveAlerts.length > 0
-    ? liveAlerts.map(a => ({
-        score: Math.round(a.ml_score * 100),
-        count: Math.round(a.confidence * 80) + 20,
-        type:  a.confidence > 0.7 ? 'anomaly' : 'normal',
-      }))
-    : Array.from({ length: 20 }, (_, i) => ({
-        score: i * 5,
-        count: Math.floor(Math.random() * 80) + 10,
-        type:  Math.random() > 0.8 ? 'anomaly' : 'normal',
-      }));
+  // ── Données graphiques ───────────────────────────────────────
+  const byAttackEntries = byAttack
+    ? Object.entries(byAttack)
+        .map(([name, data]: [string, any]) => ({
+          name,
+          label: getAttackLabel(name),
+          fpr: getAttackMetricValue(data, ["fpr", "false_positive_rate"]),
+          tpr: getAttackMetricValue(data, [
+            "recall",
+            "tpr",
+            "true_positive_rate",
+          ]),
+          recall: getAttackMetricValue(data, [
+            "recall",
+            "tpr",
+            "true_positive_rate",
+          ]),
+          precision: getAttackMetricValue(data, ["precision"]),
+          f1: getAttackMetricValue(data, ["f1", "f1_score"]),
+          h1_passed: Boolean(
+            data?.h1_passed ?? getAttackMetricValue(data, ["recall"]) >= 0.7,
+          ),
+        }))
+        .filter((d) => d.name && (d.tpr > 0 || d.fpr > 0 || d.recall > 0))
+    : [];
+
+  // ROC réelle depuis LOAO/by_attack. Si l'API ne fournit pas by_attack,
+  // on n'affiche pas une courbe artificielle.
+  const rocData = byAttackEntries
+    .map((d) => ({ fpr: d.fpr, tpr: d.tpr, name: d.label }))
+    .sort((a, b) => a.fpr - b.fpr);
+
+  // Distribution déterministe depuis les alertes visibles.
+  // Aucun fallback aléatoire : si pas de données, on affiche un message.
+  const scoreDistribution = liveAlerts.map((a) => {
+    const scoreFromMl = Number(a.ml_score || 0);
+    const scoreFromConf = Number(a.confidence || 0);
+    const score = Math.round(Math.max(scoreFromMl, scoreFromConf) * 100);
+    return {
+      score: Math.min(Math.max(score, 0), 100),
+      count: 1,
+      type: a.confidence > 0.7 || a.ml_score > 0.7 ? "anomaly" : "normal",
+      label: a.attack_type || "Unknown",
+    };
+  });
 
   const fusionBarData = fusionStats
-    ? [1, 2, 3, 4, 5].map(n => ({
-        name:  FUSION_LABEL[n],
+    ? [1, 2, 3, 4, 5].map((n) => ({
+        name: FUSION_LABEL[n],
         count: fusionStats.cases?.[`case_${n}`] || 0,
-        fill:  FUSION_COLOR[n],
+        fill: FUSION_COLOR[n],
       }))
     : [];
 
-  const avgConf = liveAlerts.length > 0
-    ? (liveAlerts.reduce((s, a) => s + a.confidence, 0) / liveAlerts.length).toFixed(2)
-    : '—';
+  const avgConf =
+    liveAlerts.length > 0
+      ? (
+          liveAlerts.reduce((s, a) => s + a.confidence, 0) / liveAlerts.length
+        ).toFixed(2)
+      : "—";
 
-  const liveOnlyCount  = liveAlerts.filter(a => a._source === 'live').length;
-  const cacheOnlyCount = liveAlerts.filter(a => a._source === 'cache').length;
+  const liveOnlyCount = liveAlerts.filter((a) => a._source === "live").length;
+  const cacheOnlyCount = liveAlerts.filter((a) => a._source === "cache").length;
 
-  // [F] Métriques réelles depuis l'API
-  const realF1     = mlModels?.metrics?.f1_mean     ?? null;
-  const realRecall = mlModels?.metrics?.recall_mean ?? null;
-  const realFpr    = mlModels?.metrics?.fpr_mean    ?? null;
-  const realAuc    = mlModels?.metrics?.auc_roc     ?? mlModels?.metrics?.mean_auc_roc ?? null;
-  const byAttack   = mlModels?.metrics?.by_attack   ?? null;
-
-  // Modèles avec leurs poids réels dans la formule ensemble
+  // Cartes explicites : les métriques F1/Recall/FPR sont celles de l'ensemble,
+  // pas les scores individuels de chaque modèle.
   const modelCards = [
-    { name: 'Isolation Forest', weight: '35%', color: 'text-blue-400',    bg: 'bg-blue-500/10'    },
-    { name: 'One-Class SVM',    weight: '30%', color: 'text-violet-400',  bg: 'bg-violet-500/10'  },
-    { name: 'Autoencoder',      weight: '35%', color: 'text-emerald-400', bg: 'bg-emerald-500/10' },
+    {
+      name: "Ensemble ML",
+      subtitle: "Vote pondéré IF + OCSVM + AE",
+      weight: "100%",
+      color: "text-blue-400",
+      bg: "bg-blue-500/10",
+    },
+    {
+      name: "Validation H1",
+      subtitle: "Recall cible ≥ 70%",
+      weight: "LOAO",
+      color: "text-violet-400",
+      bg: "bg-violet-500/10",
+    },
+    {
+      name: "Version modèle",
+      subtitle: "Déploiement actif",
+      weight: "prod",
+      color: "text-emerald-400",
+      bg: "bg-emerald-500/10",
+    },
   ];
 
   return (
     <div className="p-6 space-y-6">
-
       {/* ── Header ─────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">IDS Monitor</h1>
           <p className="text-sm text-muted-foreground">
-            M1 Suricata · M2 ML Anomalie · M3 Fusion Hybride — données temps réel
+            M1 Suricata · M2 ML Anomalie · M3 Fusion Hybride — données temps
+            réel
           </p>
         </div>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2">
-            <Switch checked={fusionEnabled} onCheckedChange={setFusionEnabled} />
+            <Switch
+              checked={fusionEnabled}
+              onCheckedChange={setFusionEnabled}
+            />
             <span className="text-sm text-muted-foreground">Fusion M3</span>
           </div>
           <div className="flex items-center gap-2">
-            {connected
-              ? <Wifi size={14} className="text-green-400" />
-              : <WifiOff size={14} className="text-red-400" />}
-            <span className={cn('text-xs font-mono', connected ? 'text-green-400' : 'text-red-400')}>
-              {connected ? `LIVE · ${liveCount} events` : 'Déconnecté'}
+            {connected ? (
+              <Wifi size={14} className="text-green-400" />
+            ) : (
+              <WifiOff size={14} className="text-red-400" />
+            )}
+            <span
+              className={cn(
+                "text-xs font-mono",
+                connected ? "text-green-400" : "text-red-400",
+              )}
+            >
+              {connected ? `LIVE · ${liveCount} events` : "Déconnecté"}
             </span>
           </div>
           {!hasLiveData && cacheOnlyCount > 0 && (
-            <Badge variant="secondary" className="bg-slate-500/10 text-slate-400 border-slate-500/30 text-[10px]">
+            <Badge
+              variant="secondary"
+              className="bg-slate-500/10 text-slate-400 border-slate-500/30 text-[10px]"
+            >
               📦 Cache Redis ({cacheOnlyCount})
             </Badge>
           )}
           {hasLiveData && liveOnlyCount > 0 && (
-            <Badge variant="secondary" className="bg-green-500/10 text-green-400 border-green-500/30 text-[10px]">
+            <Badge
+              variant="secondary"
+              className="bg-green-500/10 text-green-400 border-green-500/30 text-[10px]"
+            >
               🔴 Live ({liveOnlyCount})
             </Badge>
           )}
           <Button
-            variant="outline" size="sm"
+            variant="outline"
+            size="sm"
             onClick={() => setIsLive(!isLive)}
-            className={cn('gap-2', isLive && 'border-green-500/50 text-green-400')}
+            className={cn(
+              "gap-2",
+              isLive && "border-green-500/50 text-green-400",
+            )}
           >
             {isLive ? <Pause size={14} /> : <Play size={14} />}
-            {isLive ? 'Pause' : 'Reprendre'}
+            {isLive ? "Pause" : "Reprendre"}
           </Button>
           <Button
-            variant="ghost" size="sm" onClick={handleClearCache}
+            variant="ghost"
+            size="sm"
+            onClick={handleClearCache}
             className="gap-2 text-slate-400 hover:text-red-400"
             title="Vider le cache Redis (dev uniquement)"
           >
@@ -386,11 +773,16 @@ export function IDSMonitor() {
         <div className="flex items-center gap-3 px-4 py-2 rounded-lg bg-slate-500/10 border border-slate-500/20 text-sm text-slate-400">
           <span>📦</span>
           <span>
-            Ces {cacheOnlyCount} alertes proviennent du cache Redis (session précédente).
-            Elles seront remplacées dès qu'une nouvelle alerte live arrivera.
+            Ces {cacheOnlyCount} alertes proviennent du cache Redis (session
+            précédente). Elles seront remplacées dès qu'une nouvelle alerte live
+            arrivera.
           </span>
-          <Button variant="ghost" size="sm" onClick={handleClearCache}
-            className="ml-auto text-slate-400 hover:text-red-400 h-6 text-xs">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleClearCache}
+            className="ml-auto text-slate-400 hover:text-red-400 h-6 text-xs"
+          >
             Effacer
           </Button>
         </div>
@@ -407,14 +799,14 @@ export function IDSMonitor() {
         />
         <StatCard
           title="Alertes ML"
-          value={liveAlerts.filter(a => a.ml_score > 0.5).length}
+          value={liveAlerts.filter((a) => a.ml_score > 0.5).length}
           subtitle="IF + OCSVM + Autoencoder"
           icon={<BrainCircuit size={20} />}
           color="violet"
         />
         <StatCard
           title="Fusion M3"
-          value={fusionStats?.total_fused ?? '—'}
+          value={fusionStats?.total_fused ?? "—"}
           subtitle={`Confidence moy. : ${avgConf}`}
           icon={<Zap size={20} />}
           color="orange"
@@ -434,28 +826,67 @@ export function IDSMonitor() {
           <CardHeader className="pb-2">
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm font-medium flex items-center gap-2">
-                <Activity size={16} className={cn(isLive && connected ? 'text-green-400 animate-pulse' : 'text-slate-400')} />
+                <Activity
+                  size={16}
+                  className={cn(
+                    isLive && connected
+                      ? "text-green-400 animate-pulse"
+                      : "text-slate-400",
+                  )}
+                />
                 Flux Alertes
-                {hasLiveData
-                  ? <Badge variant="secondary" className="bg-green-500/10 text-green-400 text-[10px]">LIVE</Badge>
-                  : <Badge variant="secondary" className="bg-slate-500/10 text-slate-400 text-[10px]">CACHE</Badge>
-                }
+                {hasLiveData ? (
+                  <Badge
+                    variant="secondary"
+                    className="bg-green-500/10 text-green-400 text-[10px]"
+                  >
+                    LIVE
+                  </Badge>
+                ) : (
+                  <Badge
+                    variant="secondary"
+                    className="bg-slate-500/10 text-slate-400 text-[10px]"
+                  >
+                    CACHE
+                  </Badge>
+                )}
               </CardTitle>
               <div className="flex gap-2">
-                <Button variant="ghost" size="icon" className="h-7 w-7"><Filter size={14} /></Button>
+                <Button variant="ghost" size="icon" className="h-7 w-7">
+                  <Filter size={14} />
+                </Button>
                 <Button
-                  variant="ghost" size="icon" className="h-7 w-7"
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
                   onClick={() => {
-                    const csv = ['severity,signature,src,dst,fusion,confidence,mitre,timestamp']
-                      .concat(liveAlerts.map(a => [
-                        a.severity, a.signature_name, a.src_ip, a.dest_ip,
-                        a.fusion_case !== null ? FUSION_LABEL[a.fusion_case!] ?? a.fusion_case : '',
-                        a.confidence.toFixed(2), a.technique_id || '', a.timestamp.toISOString(),
-                      ].join(','))).join('\n');
-                    const b = new Blob([csv], { type: 'text/csv' });
+                    const csv = [
+                      "severity,attack_type,signature,src,dst,fusion,confidence,mitre,timestamp",
+                    ]
+                      .concat(
+                        liveAlerts.map((a) =>
+                          [
+                            a.severity,
+                            a.attack_type || "",
+                            a.signature_name,
+                            a.src_ip,
+                            a.dest_ip,
+                            a.fusion_case !== null
+                              ? FUSION_LABEL[a.fusion_case!] ?? a.fusion_case
+                              : "",
+                            a.confidence.toFixed(2),
+                            a.technique_id || "",
+                            a.timestamp.toISOString(),
+                          ].join(","),
+                        ),
+                      )
+                      .join("\n");
+                    const b = new Blob([csv], { type: "text/csv" });
                     const u = URL.createObjectURL(b);
-                    const x = document.createElement('a');
-                    x.href = u; x.download = 'alerts.csv'; x.click();
+                    const x = document.createElement("a");
+                    x.href = u;
+                    x.download = "alerts.csv";
+                    x.click();
                   }}
                 >
                   <Download size={14} />
@@ -468,11 +899,17 @@ export function IDSMonitor() {
               {liveAlerts.length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground text-sm">
                   En attente d'alertes...
-                  <p className="text-xs mt-1 opacity-60">Injectez une ligne dans eve.json pour tester</p>
+                  <p className="text-xs mt-1 opacity-60">
+                    Injectez une ligne dans eve.json pour tester
+                  </p>
                 </div>
               ) : (
                 liveAlerts.map((alert, index) => (
-                  <AlertRow key={`${alert.id}-${index}`} alert={alert} index={index} />
+                  <AlertRow
+                    key={alert.dedup_key || `${alert.id}-${index}`}
+                    alert={alert}
+                    index={index}
+                  />
                 ))
               )}
             </div>
@@ -481,32 +918,91 @@ export function IDSMonitor() {
 
         <Card className="bg-card/50 border-cyber-border">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Courbe ROC — Performance ML</CardTitle>
+            <CardTitle className="text-sm font-medium">
+              Performance LOAO — ROC réelle par type
+            </CardTitle>
           </CardHeader>
           <CardContent>
             <div className="h-80">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={rocData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1E232C" />
-                  <XAxis dataKey="fpr" stroke="#4B5563" fontSize={10}
-                    tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
-                    label={{ value: 'Taux Faux Positifs', position: 'bottom', fontSize: 10, fill: '#4B5563' }} />
-                  <YAxis stroke="#4B5563" fontSize={10}
-                    tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
-                    label={{ value: 'Taux Vrais Positifs', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#4B5563' }} />
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }}
-                    formatter={(v: any) => typeof v === 'number' ? `${(v * 100).toFixed(1)}%` : v}
-                  />
-                  <ReferenceLine segment={[{ x: 0, y: 0 }, { x: 1, y: 1 }]} stroke="#4B5563" strokeDasharray="3 3" />
-                  <Line type="monotone" dataKey="tpr" stroke="#7F77DD" strokeWidth={2} dot={false} />
-                </LineChart>
-              </ResponsiveContainer>
+              {rocData.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-sm text-muted-foreground text-center px-6">
+                  <span>En attente des métriques LOAO réelles...</span>
+                  <span className="text-xs opacity-60 mt-1">
+                    Aucun graphique ROC artificiel n'est généré.
+                  </span>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <ScatterChart>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1E232C" />
+                    <XAxis
+                      type="number"
+                      dataKey="fpr"
+                      domain={[0, 1]}
+                      stroke="#4B5563"
+                      fontSize={10}
+                      tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
+                      label={{
+                        value: "FPR réel",
+                        position: "bottom",
+                        fontSize: 10,
+                        fill: "#4B5563",
+                      }}
+                    />
+                    <YAxis
+                      type="number"
+                      dataKey="tpr"
+                      domain={[0, 1]}
+                      stroke="#4B5563"
+                      fontSize={10}
+                      tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
+                      label={{
+                        value: "Recall réel",
+                        angle: -90,
+                        position: "insideLeft",
+                        fontSize: 10,
+                        fill: "#4B5563",
+                      }}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: "#161922",
+                        border: "1px solid #1E232C",
+                        borderRadius: "8px",
+                      }}
+                      formatter={(v: any) => {
+                        if (typeof v === "number")
+                          return `${(v * 100).toFixed(1)}%`;
+                        return v;
+                      }}
+                      labelFormatter={(_, payload) =>
+                        payload?.[0]?.payload?.name || "Attaque"
+                      }
+                    />
+                    <ReferenceLine
+                      segment={[
+                        { x: 0, y: 0 },
+                        { x: 1, y: 1 },
+                      ]}
+                      stroke="#4B5563"
+                      strokeDasharray="3 3"
+                    />
+                    <Scatter name="LOAO" data={rocData} fill="#7F77DD" />
+                  </ScatterChart>
+                </ResponsiveContainer>
+              )}
             </div>
             <div className="flex justify-between text-xs text-muted-foreground mt-2">
               {/* [F] AUC réel si disponible */}
-              <span>AUC : {realAuc !== null ? realAuc.toFixed(3) : (scoreHistory.length > 5 ? '0.907' : '—')}</span>
-              <span>Recall moyen : {realRecall !== null ? `${(realRecall * 100).toFixed(1)}%` : '—'}</span>
+              <span>AUC : {realAuc !== null ? realAuc.toFixed(3) : "—"}</span>
+              <span>
+                Recall moyen :{" "}
+                {realRecall !== null
+                  ? `${(realRecall * 100).toFixed(1)}%`
+                  : "—"}{" "}
+                · Points LOAO : {rocData.length} · Scores live :{" "}
+                {scoreHistory.length}
+              </span>
             </div>
           </CardContent>
         </Card>
@@ -516,26 +1012,68 @@ export function IDSMonitor() {
       <Card className="bg-card/50 border-cyber-border">
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
-            <CardTitle className="text-sm font-medium">Distribution des Scores ML</CardTitle>
+            <CardTitle className="text-sm font-medium">
+              Distribution des Scores ML
+            </CardTitle>
             <div className="flex gap-4 text-xs">
-              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-violet-500" /> Normal</span>
-              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" /> Anomalie</span>
+              <span className="flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-violet-500" /> Normal
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-red-500" /> Anomalie
+              </span>
             </div>
           </div>
         </CardHeader>
         <CardContent>
           <div className="h-48">
-            <ResponsiveContainer width="100%" height="100%">
-              <ScatterChart>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1E232C" />
-                <XAxis type="number" dataKey="score" name="Score" domain={[0, 100]} stroke="#4B5563" fontSize={10} />
-                <YAxis type="number" dataKey="count" name="Count" stroke="#4B5563" fontSize={10} />
-                <ZAxis type="number" dataKey="count" range={[20, 100]} />
-                <Tooltip cursor={{ strokeDasharray: '3 3' }}
-                  contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }} />
-                <Scatter name="Scores" data={scoreDistribution} fill="#7F77DD" />
-              </ScatterChart>
-            </ResponsiveContainer>
+            {scoreDistribution.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-sm text-muted-foreground text-center px-6">
+                <span>En attente de scores ML réels...</span>
+                <span className="text-xs opacity-60 mt-1">
+                  Le graphique apparaîtra après réception d'alertes ou
+                  d'événements ML.
+                </span>
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <ScatterChart>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1E232C" />
+                  <XAxis
+                    type="number"
+                    dataKey="score"
+                    name="Score"
+                    domain={[0, 100]}
+                    stroke="#4B5563"
+                    fontSize={10}
+                  />
+                  <YAxis
+                    type="number"
+                    dataKey="count"
+                    name="Occurrences"
+                    stroke="#4B5563"
+                    fontSize={10}
+                  />
+                  <ZAxis type="number" dataKey="count" range={[30, 160]} />
+                  <Tooltip
+                    cursor={{ strokeDasharray: "3 3" }}
+                    contentStyle={{
+                      backgroundColor: "#161922",
+                      border: "1px solid #1E232C",
+                      borderRadius: "8px",
+                    }}
+                    formatter={(v: any, name: any) =>
+                      name === "score" ? `${v}%` : v
+                    }
+                  />
+                  <Scatter
+                    name="Scores"
+                    data={scoreDistribution}
+                    fill="#7F77DD"
+                  />
+                </ScatterChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -549,18 +1087,42 @@ export function IDSMonitor() {
         </CardHeader>
         <CardContent>
           <div className="h-40">
-            {fusionBarData.every(d => d.count === 0) ? (
+            {fusionBarData.every((d) => d.count === 0) ? (
               <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
                 En attente de données fusion...
               </div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={fusionBarData} layout="vertical" margin={{ left: 16 }}>
-                  <XAxis type="number" stroke="#4B5563" fontSize={10} tickLine={false} />
-                  <YAxis dataKey="name" type="category" stroke="#4B5563" fontSize={10} width={90} tickLine={false} />
-                  <Tooltip contentStyle={{ backgroundColor: '#161922', border: '1px solid #1E232C', borderRadius: '8px' }} />
+                <BarChart
+                  data={fusionBarData}
+                  layout="vertical"
+                  margin={{ left: 16 }}
+                >
+                  <XAxis
+                    type="number"
+                    stroke="#4B5563"
+                    fontSize={10}
+                    tickLine={false}
+                  />
+                  <YAxis
+                    dataKey="name"
+                    type="category"
+                    stroke="#4B5563"
+                    fontSize={10}
+                    width={90}
+                    tickLine={false}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "#161922",
+                      border: "1px solid #1E232C",
+                      borderRadius: "8px",
+                    }}
+                  />
                   <Bar dataKey="count" radius={[0, 4, 4, 0]}>
-                    {fusionBarData.map((d, i) => <Cell key={i} fill={d.fill} />)}
+                    {fusionBarData.map((d, i) => (
+                      <Cell key={i} fill={d.fill} />
+                    ))}
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
@@ -578,51 +1140,75 @@ export function IDSMonitor() {
                 <div>
                   <h4 className="font-medium text-sm">{model.name}</h4>
                   <p className="text-xs text-muted-foreground">
-                    Poids : {model.weight}
+                    {model.subtitle} · {model.weight}
                     {mlModels?.version && (
-                      <span className="ml-2 font-mono opacity-60">{mlModels.version.slice(-8)}</span>
+                      <span className="ml-2 font-mono opacity-60">
+                        {mlModels.version.slice(-8)}
+                      </span>
                     )}
                   </p>
                 </div>
                 <Badge
                   variant="secondary"
-                  className={cn(mlModels ? 'bg-green-500/10 text-green-400' : 'bg-amber-500/10 text-amber-400')}
+                  className={cn(
+                    mlModels
+                      ? "bg-green-500/10 text-green-400"
+                      : "bg-amber-500/10 text-amber-400",
+                  )}
                 >
-                  {mlModels ? 'active' : 'loading'}
+                  {mlModels ? "active" : "loading"}
                 </Badge>
               </div>
 
-              {/* Métriques F1 / Recall / FPR */}
+              {/* Métriques ensemble F1 / Recall / FPR */}
               <div className="grid grid-cols-3 gap-2 text-center">
                 <div>
-                  <p className={cn('text-lg font-bold font-mono', model.color)}>
-                    {realF1 !== null ? `${(realF1 * 100).toFixed(1)}%` : '—'}
+                  <p className={cn("text-lg font-bold font-mono", model.color)}>
+                    {realF1 !== null ? `${(realF1 * 100).toFixed(1)}%` : "—"}
                   </p>
                   <p className="text-[10px] text-muted-foreground">F1</p>
                 </div>
                 <div>
-                  <p className={cn(
-                    'text-lg font-bold font-mono',
-                    realRecall === null ? model.color :
-                    realRecall >= 0.70 ? 'text-green-400' : 'text-red-400'
-                  )}>
-                    {realRecall !== null ? `${(realRecall * 100).toFixed(1)}%` : '—'}
+                  <p
+                    className={cn(
+                      "text-lg font-bold font-mono",
+                      realRecall === null
+                        ? model.color
+                        : realRecall >= 0.7
+                          ? "text-green-400"
+                          : "text-red-400",
+                    )}
+                  >
+                    {realRecall !== null
+                      ? `${(realRecall * 100).toFixed(1)}%`
+                      : "—"}
                   </p>
                   <p className="text-[10px] text-muted-foreground">Recall</p>
                   {realRecall !== null && (
-                    <p className={cn('text-[9px]', realRecall >= 0.70 ? 'text-green-400' : 'text-red-400')}>
-                      {realRecall >= 0.70 ? '✓ H1' : '✗ H1'}
+                    <p
+                      className={cn(
+                        "text-[9px]",
+                        realRecall >= 0.7 ? "text-green-400" : "text-red-400",
+                      )}
+                    >
+                      {realRecall >= 0.7 ? "✓ H1" : "✗ H1"}
                     </p>
                   )}
                 </div>
                 <div>
-                  <p className={cn(
-                    'text-lg font-bold font-mono',
-                    realFpr === null ? model.color :
-                    realFpr <= 0.10 ? 'text-green-400' :
-                    realFpr <= 0.15 ? 'text-amber-400' : 'text-red-400'
-                  )}>
-                    {realFpr !== null ? `${(realFpr * 100).toFixed(1)}%` : '—'}
+                  <p
+                    className={cn(
+                      "text-lg font-bold font-mono",
+                      realFpr === null
+                        ? model.color
+                        : realFpr <= 0.1
+                          ? "text-green-400"
+                          : realFpr <= 0.15
+                            ? "text-amber-400"
+                            : "text-red-400",
+                    )}
+                  >
+                    {realFpr !== null ? `${(realFpr * 100).toFixed(1)}%` : "—"}
                   </p>
                   <p className="text-[10px] text-muted-foreground">FPR</p>
                 </div>
@@ -637,14 +1223,19 @@ export function IDSMonitor() {
                   </div>
                   <div className="relative h-1.5 bg-muted/30 rounded-full overflow-hidden">
                     <div
-                      className={cn('h-full rounded-full transition-all duration-700',
-                        realRecall >= 0.70 ? 'bg-green-400' : 'bg-red-400')}
+                      className={cn(
+                        "h-full rounded-full transition-all duration-700",
+                        realRecall >= 0.7 ? "bg-green-400" : "bg-red-400",
+                      )}
                       style={{ width: `${Math.min(realRecall * 100, 100)}%` }}
                     />
                   </div>
                   {/* Marqueur 70% */}
                   <div className="relative h-2 mt-0.5">
-                    <div className="absolute top-0 w-px h-2 bg-amber-400 opacity-70" style={{ left: '70%' }} />
+                    <div
+                      className="absolute top-0 w-px h-2 bg-amber-400 opacity-70"
+                      style={{ left: "70%" }}
+                    />
                   </div>
                 </div>
               )}
@@ -660,19 +1251,37 @@ export function IDSMonitor() {
                     .map(([type, data]: [string, any]) => (
                       <div key={type} className="flex items-center gap-2">
                         <span className="text-[9px] text-muted-foreground truncate flex-1">
-                          {type.replace('Web Attack – ', '').replace('DoS ', '').replace('-Patator', '')}
+                          {type
+                            .replace("Web Attack – ", "")
+                            .replace("DoS ", "")
+                            .replace("-Patator", "")}
                         </span>
                         <div className="w-14 h-1 bg-muted/30 rounded-full overflow-hidden">
                           <div
-                            className={cn('h-full rounded-full', data.recall >= 0.70 ? 'bg-green-400' : 'bg-red-400')}
-                            style={{ width: `${Math.min(data.recall * 100, 100)}%` }}
+                            className={cn(
+                              "h-full rounded-full",
+                              data.recall >= 0.7
+                                ? "bg-green-400"
+                                : "bg-red-400",
+                            )}
+                            style={{
+                              width: `${Math.min(data.recall * 100, 100)}%`,
+                            }}
                           />
                         </div>
-                        <span className={cn('text-[9px] font-mono w-8 text-right',
-                          data.recall >= 0.70 ? 'text-green-400' : 'text-red-400')}>
+                        <span
+                          className={cn(
+                            "text-[9px] font-mono w-8 text-right",
+                            data.recall >= 0.7
+                              ? "text-green-400"
+                              : "text-red-400",
+                          )}
+                        >
                           {(data.recall * 100).toFixed(0)}%
                         </span>
-                        <span className="text-[9px]">{data.h1_passed ? '✓' : '✗'}</span>
+                        <span className="text-[9px]">
+                          {data.h1_passed ? "✓" : "✗"}
+                        </span>
                       </div>
                     ))}
                 </div>
@@ -681,11 +1290,17 @@ export function IDSMonitor() {
               {/* Version active sur la 2ème carte */}
               {mlModels?.version && i === 1 && (
                 <div className="mt-3 border-t border-cyber-border pt-2">
-                  <p className="text-[9px] text-muted-foreground">Version active</p>
-                  <p className="text-[10px] font-mono text-violet-400">{mlModels.version}</p>
+                  <p className="text-[9px] text-muted-foreground">
+                    Version active
+                  </p>
+                  <p className="text-[10px] font-mono text-violet-400">
+                    {mlModels.version}
+                  </p>
                   {mlModels?.is_active !== undefined && (
                     <p className="text-[9px] text-muted-foreground mt-0.5">
-                      {mlModels.is_active ? '● Déployé en production' : '○ Non déployé'}
+                      {mlModels.is_active
+                        ? "● Déployé en production"
+                        : "○ Non déployé"}
                     </p>
                   )}
                 </div>
@@ -694,18 +1309,21 @@ export function IDSMonitor() {
               {/* AUC sur la 3ème carte */}
               {i === 2 && (
                 <div className="mt-3 border-t border-cyber-border pt-2">
-                  <p className="text-[9px] text-muted-foreground">AUC-ROC moyen</p>
-                  <p className={cn('text-lg font-bold font-mono', model.color)}>
-                    {realAuc !== null ? realAuc.toFixed(3) : '0.902'}
+                  <p className="text-[9px] text-muted-foreground">
+                    AUC-ROC moyen
                   </p>
-                  <p className="text-[9px] text-muted-foreground">Séparation BENIGN/attaque</p>
+                  <p className={cn("text-lg font-bold font-mono", model.color)}>
+                    {realAuc !== null ? realAuc.toFixed(3) : "—"}
+                  </p>
+                  <p className="text-[9px] text-muted-foreground">
+                    Séparation BENIGN/attaque
+                  </p>
                 </div>
               )}
             </CardContent>
           </Card>
         ))}
       </div>
-
     </div>
   );
 }

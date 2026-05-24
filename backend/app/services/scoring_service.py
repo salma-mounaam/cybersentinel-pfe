@@ -12,6 +12,7 @@
 #   [LLM] attack_type Llama intégré dans titre + description incident
 #   [M11] hids_confirmed renforce score_e
 #   [M12] AssetResolver récupère la criticité réelle depuis Asset Registry
+#   [M12] Les incidents utilisent alert.asset_ip / alert.asset_name / alert.asset_criticality
 # ============================================================
 
 import json
@@ -32,6 +33,7 @@ from app.services.asset_resolver import AssetResolver
 
 logger = logging.getLogger(__name__)
 
+
 # SLA par niveau de sévérité
 SLA_MAP = {
     SeverityLevel.CRITIQUE: timedelta(hours=1),
@@ -39,6 +41,7 @@ SLA_MAP = {
     SeverityLevel.MOYEN: timedelta(hours=48),
     SeverityLevel.FAIBLE: timedelta(days=14),
 }
+
 
 # Fallback si aucun asset n'est trouvé en base
 DEFAULT_ASSET_CRITICALITY = {
@@ -50,6 +53,7 @@ DEFAULT_ASSET_CRITICALITY = {
     "dev": 4.0,
     "test": 3.0,
 }
+
 
 # Fallback IP -> criticité si aucun asset n'est trouvé en base
 IP_CRITICALITY_MAP = {
@@ -254,13 +258,37 @@ class RiskScoringEngine:
             or sast_dast_confirmed
         )
 
-        # M12 — Criticité réelle depuis Asset Registry
-        # Priorité : dest_ip, puis src_ip si la machine surveillée est source
-        asset_criticality = await self.get_asset_criticality(
-            asset_ip=alert.dest_ip or "",
-            asset_name=getattr(alert, "asset_name", "") or alert.dest_ip or "",
-            fallback_src_ip=alert.src_ip or "",
-        )
+        # ============================================================
+        # M12 — Asset depuis l'alerte enrichie par SuricataEveWatcher
+        # Priorité :
+        # 1. alert.asset_ip / alert.asset_name / alert.asset_criticality
+        # 2. Asset Registry
+        # 3. fallback IP/nom
+        # ============================================================
+
+        alert_asset_ip = getattr(alert, "asset_ip", None) or alert.dest_ip or ""
+        alert_asset_name = getattr(alert, "asset_name", None) or alert_asset_ip
+
+        alert_asset_criticality = getattr(alert, "asset_criticality", None)
+
+        if alert_asset_criticality is not None:
+            try:
+                asset_criticality = max(
+                    0.0,
+                    min(float(alert_asset_criticality), 10.0),
+                )
+            except Exception:
+                asset_criticality = await self.get_asset_criticality(
+                    asset_ip=alert_asset_ip,
+                    asset_name=alert_asset_name,
+                    fallback_src_ip=alert.src_ip or "",
+                )
+        else:
+            asset_criticality = await self.get_asset_criticality(
+                asset_ip=alert_asset_ip,
+                asset_name=alert_asset_name,
+                fallback_src_ip=alert.src_ip or "",
+            )
 
         score_result = self.compute_score_r(
             anomaly_score=anomaly_score,
@@ -299,9 +327,10 @@ class RiskScoringEngine:
                 f"{(alert.technique_id or 'T1190').replace('.', '/')}/"
             ),
 
-            asset_ip=alert.dest_ip,
-            asset_name=getattr(alert, "asset_name", None) or alert.dest_ip,
+            asset_ip=alert_asset_ip,
+            asset_name=alert_asset_name,
             asset_criticality=asset_criticality,
+
             sla_deadline=sla_deadline,
             description=self._build_description(
                 alert=alert,
@@ -320,12 +349,14 @@ class RiskScoringEngine:
             await db.refresh(incident)
 
         logger.info(
-            "📋 Incident créé | #%s | R=%s | E=%s | C=%s | severity=%s | "
+            "📋 Incident créé | #%s | R=%s | E=%s | C=%s | asset=%s/%s | severity=%s | "
             "hids_confirmed=%s | dast_confirmed=%s | %s",
             incident.id,
             incident.score_r,
             incident.score_e,
             incident.score_c,
+            incident.asset_name,
+            incident.asset_ip,
             incident.severity.value,
             runtime_hids_confirmed,
             bool(runtime_dast_confirmed or sast_dast_confirmed),
@@ -476,7 +507,7 @@ class RiskScoringEngine:
     def _build_incident_title(self, alert: Alert, severity: SeverityLevel) -> str:
         """
         [LLM] Construit un titre lisible avec attack_type Llama.
-        Exemple : "BruteForce SSH — 10.16.2.157 → 10.16.2.150"
+        Exemple : "BruteForce SSH — 10.16.2.157 → test-vm-01"
         """
         attack_label = (
             getattr(alert, "attack_type", None)
@@ -486,7 +517,12 @@ class RiskScoringEngine:
         )
 
         src = alert.src_ip or "IP inconnue"
-        dst = alert.dest_ip or "asset inconnu"
+        dst = (
+            getattr(alert, "asset_name", None)
+            or getattr(alert, "asset_ip", None)
+            or alert.dest_ip
+            or "asset inconnu"
+        )
 
         return f"{attack_label} — {src} → {dst}"
 
@@ -505,6 +541,14 @@ class RiskScoringEngine:
         """
         attack_type = getattr(alert, "attack_type", None) or "Unknown"
 
+        asset_name = (
+            getattr(alert, "asset_name", None)
+            or getattr(alert, "asset_ip", None)
+            or alert.dest_ip
+            or "Unknown"
+        )
+        asset_ip = getattr(alert, "asset_ip", None) or alert.dest_ip or "Unknown"
+
         lines = [
             f"Score R = {score_result['score_r']} ({score_result['severity']})",
             f"Formule : {score_result['formula']}",
@@ -514,6 +558,10 @@ class RiskScoringEngine:
             f"  - V CVSS/MITRE/SAST : {score_result['score_v']}",
             f"  - E Exploitabilité confirmée : {score_result['score_e']}",
             f"  - C Criticité asset : {score_result['score_c']}",
+            "",
+            "Asset concerné :",
+            f"  - Nom : {asset_name}",
+            f"  - IP : {asset_ip}",
             "",
             "Confirmations :",
             f"  - DAST confirmé : {dast_confirmed}",
@@ -591,10 +639,12 @@ class RiskScoringEngine:
             await r.setex(f"critical:{incident.id}", 86400, payload)
 
             logger.critical(
-                "🚨 INCIDENT CRITIQUE #%s | R=%s | C=%s | %s | SLA < 1 heure",
+                "🚨 INCIDENT CRITIQUE #%s | R=%s | C=%s | asset=%s/%s | %s | SLA < 1 heure",
                 incident.id,
                 incident.score_r,
                 incident.score_c,
+                incident.asset_name,
+                incident.asset_ip,
                 incident.title,
             )
         except Exception as e:

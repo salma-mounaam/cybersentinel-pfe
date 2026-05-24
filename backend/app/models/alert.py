@@ -15,7 +15,7 @@ class AlertSource(str, enum.Enum):
     M1_SURICATA = "M1_suricata"
     M2_ML       = "M2_ml"
     M3_FUSION   = "M3_fusion"
-    M11_WAZUH = "M11_wazuh"
+    M11_WAZUH   = "M11_wazuh"
 
 
 class Alert(Base):
@@ -31,6 +31,11 @@ class Alert(Base):
     src_port       = Column(Integer)
     dest_port      = Column(Integer)
     protocol       = Column(String(10))
+
+    # Asset ciblé / machine surveillée
+    asset_ip          = Column(String(45), nullable=True)
+    asset_name        = Column(String(255), nullable=True)
+    asset_criticality = Column(Float, default=5.0)
 
     # Suricata (M1)
     signature_id   = Column(Integer, nullable=True)
@@ -69,5 +74,6 @@ class Alert(Base):
     def __repr__(self):
         return (
             f"<Alert {self.id} | {self.source} | "
-            f"{self.severity} | {self.attack_type or 'Unknown'}>"
+            f"{self.severity} | {self.attack_type or 'Unknown'} | "
+            f"asset={self.asset_name or self.asset_ip or 'Unknown'}>"
         )

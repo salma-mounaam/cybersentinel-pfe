@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     SURICATA_EVE_LOG: str = "/var/log/suricata/eve.json"
 
     # ============================================================
+    # Agent ingestion / Fluent Bit
+    # ============================================================
+    AGENT_INGEST_TOKEN: str = "cs_1d48075f3ed91d0e84c7e00f977dd0ca0ab0c930"
+
+    # ============================================================
     # DAST / Docker Compose
     # ============================================================
     CYBERSENTINEL_COMPOSE_FILE: str = "/app/docker-compose.yml"
@@ -62,7 +67,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
-        extra="ignore"
+        extra="ignore",
     )
 
     def __init__(self, **values):

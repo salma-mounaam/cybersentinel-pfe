@@ -5,9 +5,13 @@ import enum
 
 
 class SASTTool(str, enum.Enum):
-    SEMGREP = "semgrep"
-    TRIVY = "trivy"
-    GITLEAKS = "gitleaks"
+    # IMPORTANT :
+    # Ces valeurs doivent correspondre exactement aux valeurs PostgreSQL :
+    # SELECT unnest(enum_range(NULL::sasttool));
+    SEMGREP = "SEMGREP"
+    TRIVY = "TRIVY"
+    GITLEAKS = "GITLEAKS"
+    DAST_ZAP = "dast_zap"
 
 
 class SASTSeverity(str, enum.Enum):
@@ -23,8 +27,25 @@ class SASTFinding(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    tool = Column(Enum(SASTTool), nullable=False)
-    severity = Column(Enum(SASTSeverity), nullable=False)
+    tool = Column(
+        Enum(
+            SASTTool,
+            name="sasttool",
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+
+    severity = Column(
+        Enum(
+            SASTSeverity,
+            name="sastseverity",
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
 
     # ============================================================
     # Localisation exacte
@@ -76,7 +97,7 @@ class SASTFinding(Base):
     secret_preview = Column(String(255), nullable=True)
 
     # ============================================================
-    # MITRE ATT&CK (M6)
+    # MITRE ATT&CK
     # ============================================================
     technique_id = Column(String(50), nullable=True)
     technique_name = Column(String(255), nullable=True)

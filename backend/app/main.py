@@ -19,6 +19,7 @@ from app.api import websocket as ws_router
 from app.api import hids as hids_router
 from app.api import wazuh
 from app.api import assets as assets_router
+from app.api import agents as agents_router
 
 # ---- Routers supplémentaires ----
 from app.api.reports import router as reports_router
@@ -50,6 +51,39 @@ watcher_task: Optional[asyncio.Task] = None
 consumer_task: Optional[asyncio.Task] = None
 wazuh_task: Optional[asyncio.Task] = None
 redis_bridge_task: Optional[asyncio.Task] = None
+purge_task: Optional[asyncio.Task] = None
+
+
+# ============================================================
+# M11 — Purge hebdomadaire Wazuh
+# ============================================================
+
+async def weekly_db_purge(consumer: WazuhConsumer):
+    """
+    Purge hebdomadaire des alertes Wazuh.
+    Première purge après 1h de démarrage, puis toutes les semaines.
+
+    Pour tester rapidement :
+    remplacer 3600 par 60.
+    """
+    await asyncio.sleep(3600)
+
+    while True:
+        try:
+            deleted = await consumer.purge_old_alerts()
+            logger.info(
+                "🧹 Purge hebdomadaire terminée : %s alertes Wazuh supprimées",
+                deleted,
+            )
+
+        except asyncio.CancelledError:
+            logger.info("🧹 Tâche purge hebdomadaire Wazuh annulée")
+            raise
+
+        except Exception as e:
+            logger.error("Erreur purge hebdomadaire : %s", e)
+
+        await asyncio.sleep(7 * 24 * 3600)
 
 
 # ============================================================
@@ -58,16 +92,24 @@ redis_bridge_task: Optional[asyncio.Task] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global watcher_task, consumer_task, wazuh_task, redis_bridge_task
+    global watcher_task
+    global consumer_task
+    global wazuh_task
+    global redis_bridge_task
+    global purge_task
 
     logger.info("🚀 CyberSentinel démarrage...")
+
+    # M12 — Rend le watcher Suricata disponible pour l'ingestion distante
+    # utilisée par POST /api/agents/events.
+    app.state.suricata_watcher = watcher
 
     # Initialisation base de données
     await init_db()
     logger.info("✅ Base de données initialisée")
 
     try:
-        # M1 — Watcher Suricata
+        # M1 — Watcher Suricata local
         watcher_task = asyncio.create_task(
             watcher.start(),
             name="suricata-watcher",
@@ -94,6 +136,13 @@ async def lifespan(app: FastAPI):
             name="wazuh-consumer",
         )
         logger.info("🛡️ Wazuh consumer démarré")
+
+        # M11 — Purge hebdomadaire Wazuh
+        purge_task = asyncio.create_task(
+            weekly_db_purge(wazuh_consumer),
+            name="weekly-db-purge",
+        )
+        logger.info("🧹 Purge hebdomadaire Wazuh planifiée (rétention 7 jours)")
 
         yield
 
@@ -127,6 +176,7 @@ async def lifespan(app: FastAPI):
             consumer_task,
             wazuh_task,
             redis_bridge_task,
+            purge_task,
         ]
 
         for task in tasks:
@@ -137,7 +187,10 @@ async def lifespan(app: FastAPI):
         pending = [task for task in tasks if task is not None]
 
         if pending:
-            results = await asyncio.gather(*pending, return_exceptions=True)
+            results = await asyncio.gather(
+                *pending,
+                return_exceptions=True,
+            )
 
             for result in results:
                 if isinstance(result, Exception) and not isinstance(
@@ -260,7 +313,14 @@ app.include_router(
 # GET    /api/assets/at-risk
 # POST   /api/agents/heartbeat
 # GET    /api/agents/status
+# POST   /api/agents/events
 # ============================================================
+
+app.include_router(
+    agents_router.router,
+    prefix="/api",
+    tags=["M12 — Agents Heartbeat"],
+)
 
 app.include_router(
     assets_router.router,
@@ -306,7 +366,7 @@ async def root():
             "M9": "WebSocket temps réel",
             "M10": "ML avancé",
             "M11": "Wazuh HIDS",
-            "M12": "Asset Registry & LLM Vulnerability Analysis",
+            "M12": "Asset Registry, Agents Heartbeat & LLM Vulnerability Analysis",
         },
     }
 
@@ -322,9 +382,12 @@ async def health():
             "incident_consumer": consumer_task is not None and not consumer_task.done(),
             "wazuh_consumer": wazuh_task is not None and not wazuh_task.done(),
             "redis_ws_bridge": redis_bridge_task is not None and not redis_bridge_task.done(),
+            "wazuh_weekly_purge": purge_task is not None and not purge_task.done(),
         },
         "modules": {
             "asset_registry": "enabled",
+            "agents_heartbeat": "enabled",
+            "remote_suricata_ingest": "enabled",
             "wazuh": "enabled",
             "hids": "enabled",
             "llm_vulnerability_analysis": "enabled",

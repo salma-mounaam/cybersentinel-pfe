@@ -1,5 +1,6 @@
 # ============================================================
-# LLM Attack Classifier — Llama 3.1 via Ollama
+# LLM Attack Classifier — IDS + HIDS + DAST/SAST
+# Llama 3.1 via Ollama
 # Cache Redis 24h pour éviter les appels répétés CPU-only
 # ============================================================
 
@@ -17,22 +18,79 @@ OLLAMA_URL = "http://172.17.0.1:11434/api/generate"
 MODEL = "llama3.1:8b"
 
 
+ALLOWED_ATTACK_TYPES = {
+    "BruteForce",
+    "AuthenticationFailure",
+    "PortScan",
+    "DoS",
+    "DDoS",
+    "SQLi",
+    "XSS",
+    "CommandInjection",
+    "Exploit",
+    "Botnet",
+    "Exfiltration",
+    "Reconnaissance",
+    "Malware",
+    "WebAttack",
+    "Infiltration",
+    "FileIntegrity",
+    "PrivilegeEscalation",
+    "Persistence",
+    "CredentialAccess",
+    "DefenseEvasion",
+    "LateralMovement",
+    "SuspiciousProcess",
+    "SystemMisconfiguration",
+    "DockerAbuse",
+    "Unknown",
+}
+
+
 async def classify_attack_with_llm(
     signature_name: str,
     category: str,
-    src_ip: str,
-    dest_ip: str,
-    dest_port: int,
-    protocol: str,
+    src_ip: str = "",
+    dest_ip: str = "",
+    dest_port: int = 0,
+    protocol: str = "",
     technique_id: str = None,
     tactic: str = None,
+
+    # Nouveaux champs pour HIDS/Wazuh/SAST/DAST
+    source: str = "M1_SURICATA",
+    agent_name: str = None,
+    agent_ip: str = None,
+    rule_id: str = None,
+    rule_groups: list | str | None = None,
+    full_log: str = None,
+    process_name: str = None,
+    username: str = None,
+    file_path: str = None,
 ) -> dict:
     """
     Classifie le type d'attaque avec Llama 3.1 via Ollama.
-    Utilise Redis pour cacher le résultat 24h.
+
+    Compatible avec :
+    - M1_SURICATA : IDS réseau
+    - M11_WAZUH   : HIDS endpoint
+    - DAST/SAST   : vulnérabilités applicatives
+
+    Utilise Redis pour cacher le résultat.
     """
 
-    cache_source = f"{signature_name}|{category}|{dest_port}|{protocol}|{technique_id}|{tactic}"
+    groups_text = ""
+    if isinstance(rule_groups, list):
+        groups_text = ",".join(str(x) for x in rule_groups)
+    elif rule_groups:
+        groups_text = str(rule_groups)
+
+    cache_source = (
+        f"{source}|{signature_name}|{category}|{src_ip}|{dest_ip}|"
+        f"{dest_port}|{protocol}|{technique_id}|{tactic}|"
+        f"{rule_id}|{groups_text}|{process_name}|{username}|{file_path}"
+    )
+
     cache_key = f"llm:attack_type:{hashlib.md5(cache_source.encode()).hexdigest()}"
 
     try:
@@ -45,7 +103,7 @@ async def classify_attack_with_llm(
 
         if cached:
             await r.aclose()
-            logger.info("LLM cache HIT | %s", signature_name)
+            logger.info("LLM cache HIT | source=%s | signature=%s", source, signature_name)
             return json.loads(cached)
 
         await r.aclose()
@@ -53,31 +111,51 @@ async def classify_attack_with_llm(
     except Exception as e:
         logger.warning("Cache Redis indisponible: %s", e)
 
-    logger.info("LLM cache MISS | %s — appel Ollama", signature_name)
+    logger.info("LLM cache MISS | source=%s | signature=%s — appel Ollama", source, signature_name)
 
-    prompt = f"""You are a cybersecurity SOC expert. Analyze this network alert.
+    prompt = f"""You are a cybersecurity SOC expert.
+Classify this alert as a concrete attack type.
 Return ONLY a valid JSON object, no markdown, no backticks, no extra text.
 
 Alert:
-- Signature: {signature_name}
+- Source: {source}
+- Signature/Rule name: {signature_name}
 - Category: {category}
-- Source IP: {src_ip}
-- Destination IP: {dest_ip}
-- Destination Port: {dest_port}
-- Protocol: {protocol}
+- Source IP: {src_ip or 'Unknown'}
+- Destination IP: {dest_ip or 'Unknown'}
+- Destination Port: {dest_port or 'Unknown'}
+- Protocol: {protocol or 'Unknown'}
 - MITRE Technique: {technique_id or 'Unknown'}
 - MITRE Tactic: {tactic or 'Unknown'}
 
+HIDS/Wazuh context:
+- Agent name: {agent_name or 'Unknown'}
+- Agent IP: {agent_ip or 'Unknown'}
+- Rule ID: {rule_id or 'Unknown'}
+- Rule groups: {groups_text or 'Unknown'}
+- Process: {process_name or 'Unknown'}
+- User: {username or 'Unknown'}
+- File path: {file_path or 'Unknown'}
+- Full log excerpt: {(full_log or 'Unknown')[:800]}
+
 Choose ONE attack type from:
-BruteForce, PortScan, DoS, DDoS, SQLi, XSS, CommandInjection,
-Exploit, Botnet, Exfiltration, Reconnaissance, Malware, WebAttack,
-Infiltration, Unknown
+BruteForce, AuthenticationFailure, PortScan, DoS, DDoS, SQLi, XSS,
+CommandInjection, Exploit, Botnet, Exfiltration, Reconnaissance,
+Malware, WebAttack, Infiltration, FileIntegrity, PrivilegeEscalation,
+Persistence, CredentialAccess, DefenseEvasion, LateralMovement,
+SuspiciousProcess, SystemMisconfiguration, DockerAbuse, Unknown
 
 Rules:
-- SSH login attempts on port 22 can be BruteForce when repeated or suspicious.
-- Nmap, SYN scan, many ports, or scan signatures should be PortScan.
-- HTTP requests to metadata endpoints such as 169.254.169.254 should be Reconnaissance.
-- Generic HTTP traffic without exploit evidence should be WebAttack or Reconnaissance depending on context.
+- Wazuh "Integrity checksum changed", "File added", "File modified", "File deleted", "syscheck" => FileIntegrity.
+- Failed SSH/PAM/login/authentication attempts => AuthenticationFailure or BruteForce if repeated/suspicious.
+- sudo abuse, root access, privilege change, UID 0, user/group added => PrivilegeEscalation.
+- Docker error, container abuse, suspicious Docker activity => DockerAbuse.
+- Suspicious process execution, shell, reverse shell, unusual command => SuspiciousProcess or CommandInjection.
+- Cron, systemd service creation, autorun, startup modification => Persistence.
+- Credential dumping, password file access, secrets access => CredentialAccess.
+- Malware, trojan, virus, rootkit indicators => Malware.
+- Web exploit, CVE, RCE, path traversal, public-facing app exploit => Exploit or WebAttack.
+- Recon, discovery, metadata endpoint, enumeration => Reconnaissance.
 - If unsure, use Unknown with low confidence.
 
 Respond exactly as JSON:
@@ -93,7 +171,7 @@ Respond exactly as JSON:
                     "stream": False,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 120,
+                        "num_predict": 160,
                     },
                 },
             )
@@ -104,7 +182,20 @@ Respond exactly as JSON:
                 response.status_code,
                 response.text[:300],
             )
-            result = _fallback_classify(signature_name, category)
+
+            result = _fallback_classify(
+                signature_name=signature_name,
+                category=category,
+                source=source,
+                rule_groups=groups_text,
+                full_log=full_log,
+                dest_port=dest_port,
+                technique_id=technique_id,
+                tactic=tactic,
+                process_name=process_name,
+                username=username,
+                file_path=file_path,
+            )
             await _cache_result(cache_key, result, ttl=3600)
             return result
 
@@ -118,13 +209,13 @@ Respond exactly as JSON:
 
         if start != -1 and end > start:
             result = json.loads(raw_text[start:end])
-
             result = _normalize_llm_result(result)
 
             await _cache_result(cache_key, result, ttl=86400)
 
             logger.info(
-                "LLM | %s → %s (conf=%.2f)",
+                "LLM | source=%s | %s → %s (conf=%.2f)",
+                source,
                 signature_name,
                 result.get("attack_type"),
                 result.get("confidence", 0),
@@ -140,7 +231,19 @@ Respond exactly as JSON:
     except Exception as e:
         logger.warning("LLM erreur: %s — fallback heuristique", e)
 
-    result = _fallback_classify(signature_name, category)
+    result = _fallback_classify(
+        signature_name=signature_name,
+        category=category,
+        source=source,
+        rule_groups=groups_text,
+        full_log=full_log,
+        dest_port=dest_port,
+        technique_id=technique_id,
+        tactic=tactic,
+        process_name=process_name,
+        username=username,
+        file_path=file_path,
+    )
     await _cache_result(cache_key, result, ttl=3600)
     return result
 
@@ -159,24 +262,6 @@ async def _cache_result(cache_key: str, result: dict, ttl: int):
 
 
 def _normalize_llm_result(result: dict) -> dict:
-    allowed_types = {
-        "BruteForce",
-        "PortScan",
-        "DoS",
-        "DDoS",
-        "SQLi",
-        "XSS",
-        "CommandInjection",
-        "Exploit",
-        "Botnet",
-        "Exfiltration",
-        "Reconnaissance",
-        "Malware",
-        "WebAttack",
-        "Infiltration",
-        "Unknown",
-    }
-
     attack_type = str(result.get("attack_type", "Unknown")).strip()
 
     aliases = {
@@ -184,6 +269,32 @@ def _normalize_llm_result(result: dict) -> dict:
         "Brute Force": "BruteForce",
         "SSH Bruteforce": "BruteForce",
         "SSH BruteForce": "BruteForce",
+
+        "Login Failure": "AuthenticationFailure",
+        "Authentication Failure": "AuthenticationFailure",
+        "AuthFailure": "AuthenticationFailure",
+        "Auth Failure": "AuthenticationFailure",
+
+        "File Integrity": "FileIntegrity",
+        "FIM": "FileIntegrity",
+        "Integrity": "FileIntegrity",
+        "File Modification": "FileIntegrity",
+
+        "Privilege Escalation": "PrivilegeEscalation",
+        "PrivEsc": "PrivilegeEscalation",
+        "Privilege Abuse": "PrivilegeEscalation",
+
+        "Credential Access": "CredentialAccess",
+        "Credential Theft": "CredentialAccess",
+
+        "Defense Evasion": "DefenseEvasion",
+        "Lateral Movement": "LateralMovement",
+        "Suspicious Process": "SuspiciousProcess",
+        "Suspicious Command": "SuspiciousProcess",
+        "Docker Abuse": "DockerAbuse",
+        "Container Abuse": "DockerAbuse",
+        "Misconfiguration": "SystemMisconfiguration",
+
         "Port Scan": "PortScan",
         "Portscan": "PortScan",
         "DDoS Attack": "DDoS",
@@ -195,7 +306,7 @@ def _normalize_llm_result(result: dict) -> dict:
 
     attack_type = aliases.get(attack_type, attack_type)
 
-    if attack_type not in allowed_types:
+    if attack_type not in ALLOWED_ATTACK_TYPES:
         attack_type = "Unknown"
 
     try:
@@ -216,41 +327,242 @@ def _normalize_llm_result(result: dict) -> dict:
     }
 
 
-def _fallback_classify(signature_name: str, category: str) -> dict:
+def _fallback_classify(
+    signature_name: str,
+    category: str,
+    source: str = "",
+    rule_groups: str = "",
+    full_log: str = "",
+    dest_port: int = 0,
+    technique_id: str = None,
+    tactic: str = None,
+    process_name: str = None,
+    username: str = None,
+    file_path: str = None,
+) -> dict:
     sig = (signature_name or "").upper()
     cat = (category or "").upper()
+    src = (source or "").upper()
+    groups = (rule_groups or "").upper()
+    log = (full_log or "").upper()
+    proc = (process_name or "").upper()
+    user = (username or "").upper()
+    path = (file_path or "").upper()
+    tech = (technique_id or "").upper()
+    tac = (tactic or "").upper()
 
-    if any(x in sig for x in ["SSH", "BRUTE", "HYDRA", "MEDUSA"]):
-        attack = "BruteForce"
-    elif any(x in sig for x in ["SCAN", "NMAP", "SWEEP", "PORTSCAN"]):
-        attack = "PortScan"
-    elif any(x in sig for x in ["DDOS"]):
-        attack = "DDoS"
-    elif any(x in sig for x in ["DOS", "FLOOD", "SLOWLORIS"]):
-        attack = "DoS"
-    elif any(x in sig for x in ["SQL", "SQLI", "UNION SELECT"]):
-        attack = "SQLi"
-    elif any(x in sig for x in ["XSS", "CROSS SITE", "SCRIPT"]):
-        attack = "XSS"
-    elif any(x in sig for x in ["COMMAND", "CMD", "INJECTION"]):
-        attack = "CommandInjection"
-    elif any(x in sig for x in ["EXPLOIT", "CVE", "RCE", "SHELL"]):
-        attack = "Exploit"
-    elif any(x in sig for x in ["BOTNET", "C2", "BEACON", "RAT"]):
-        attack = "Botnet"
-    elif any(x in sig for x in ["EXFIL", "DATA", "LEAK", "DNS TXT"]):
-        attack = "Exfiltration"
-    elif any(x in sig for x in ["RECON", "DISCOVERY", "METADATA"]):
-        attack = "Reconnaissance"
-    elif any(x in cat for x in ["WEB", "HTTP", "POLICY"]):
-        attack = "WebAttack"
-    elif any(x in cat for x in ["TROJAN", "MALWARE", "VIRUS"]):
+    text = f"{sig} {cat} {src} {groups} {log} {proc} {user} {path} {tech} {tac}"
+
+    confidence = 0.65
+
+    # ========================================================
+    # HIDS / Wazuh
+    # ========================================================
+
+    if any(x in text for x in [
+        "INTEGRITY CHECKSUM CHANGED",
+        "FILE ADDED",
+        "FILE MODIFIED",
+        "FILE DELETED",
+        "SYSCHECK",
+        "FIM",
+        "INTEGRITY",
+    ]):
+        attack = "FileIntegrity"
+        confidence = 0.75
+
+    elif any(x in text for x in [
+        "PAM",
+        "LOGIN FAILED",
+        "FAILED PASSWORD",
+        "AUTHENTICATION FAILURE",
+        "INVALID USER",
+        "SSHD",
+        "MULTIPLE AUTHENTICATION FAILURES",
+        "MAXIMUM AUTHENTICATION ATTEMPTS",
+    ]):
+        if dest_port == 22 or "SSH" in text or "SSHD" in text:
+            attack = "BruteForce"
+            confidence = 0.75
+        else:
+            attack = "AuthenticationFailure"
+            confidence = 0.70
+
+    elif any(x in text for x in [
+        "SUDO",
+        "ROOT",
+        "PRIVILEGE",
+        "PRIVILEGE ESCALATION",
+        "USER ADDED",
+        "GROUP ADDED",
+        "USER MODIFIED",
+        "UID 0",
+        "EUID=0",
+        "BECAME ROOT",
+    ]):
+        attack = "PrivilegeEscalation"
+        confidence = 0.72
+
+    elif any(x in text for x in [
+        "PASSWD",
+        "SHADOW",
+        "CREDENTIAL",
+        "PASSWORD",
+        "SECRET",
+        "TOKEN",
+        "PRIVATE KEY",
+        "ID_RSA",
+    ]):
+        attack = "CredentialAccess"
+        confidence = 0.72
+
+    elif any(x in text for x in [
+        "DOCKER",
+        "CONTAINER",
+        "DOCKER DAEMON",
+        "DOCKER ERROR",
+        "IMAGE PULL",
+        "CONTAINER START",
+        "CONTAINER EXEC",
+    ]):
+        attack = "DockerAbuse"
+        confidence = 0.68
+
+    elif any(x in text for x in [
+        "PROCESS",
+        "COMMAND EXECUTION",
+        "SHELL",
+        "BASH",
+        "NC ",
+        "NETCAT",
+        "REVERSE SHELL",
+        "POWERSHELL",
+        "CMD.EXE",
+        "/BIN/SH",
+        "/BIN/BASH",
+    ]):
+        attack = "SuspiciousProcess"
+        confidence = 0.70
+
+    elif any(x in text for x in [
+        "CRON",
+        "CRONTAB",
+        "SERVICE INSTALLED",
+        "SYSTEMD",
+        "AUTO START",
+        "STARTUP",
+        "PERSISTENCE",
+        "AUTHORIZED_KEYS",
+    ]):
+        attack = "Persistence"
+        confidence = 0.70
+
+    elif any(x in text for x in [
+        "MALWARE",
+        "TROJAN",
+        "VIRUS",
+        "ROOTKIT",
+        "RAT",
+        "YARA",
+        "CLAMAV",
+    ]):
         attack = "Malware"
+        confidence = 0.80
+
+    elif any(x in text for x in [
+        "CONFIGURATION",
+        "MISCONFIGURATION",
+        "INSECURE",
+        "WEAK PERMISSION",
+        "PERMISSION",
+        "WORLD WRITABLE",
+    ]):
+        attack = "SystemMisconfiguration"
+        confidence = 0.62
+
+    # ========================================================
+    # IDS / Réseau / Suricata
+    # ========================================================
+
+    elif any(x in text for x in ["SSH", "BRUTE", "HYDRA", "MEDUSA"]):
+        attack = "BruteForce"
+        confidence = 0.75
+
+    elif any(x in text for x in ["SCAN", "NMAP", "SWEEP", "PORTSCAN", "SYN SCAN"]):
+        attack = "PortScan"
+        confidence = 0.75
+
+    elif "DDOS" in text:
+        attack = "DDoS"
+        confidence = 0.75
+
+    elif any(x in text for x in ["DOS", "FLOOD", "SLOWLORIS"]):
+        attack = "DoS"
+        confidence = 0.72
+
+    elif any(x in text for x in ["SQL", "SQLI", "UNION SELECT", "SELECT FROM"]):
+        attack = "SQLi"
+        confidence = 0.78
+
+    elif any(x in text for x in ["XSS", "CROSS SITE", "SCRIPT", "<SCRIPT"]):
+        attack = "XSS"
+        confidence = 0.78
+
+    elif any(x in text for x in [
+        "COMMAND",
+        "CMD",
+        "INJECTION",
+        "RCE",
+        "REMOTE CODE EXECUTION",
+    ]):
+        attack = "CommandInjection"
+        confidence = 0.78
+
+    elif any(x in text for x in [
+        "EXPLOIT",
+        "CVE",
+        "SHELL",
+        "PATH TRAVERSAL",
+        "TRAVERSAL",
+        "PUBLIC-FACING",
+    ]):
+        attack = "Exploit"
+        confidence = 0.72
+
+    elif any(x in text for x in ["BOTNET", "C2", "BEACON", "RAT"]):
+        attack = "Botnet"
+        confidence = 0.75
+
+    elif any(x in text for x in [
+        "EXFIL",
+        "DATA LEAK",
+        "DNS TXT",
+        "DATA EXFILTRATION",
+        "UPLOAD SUSPICIOUS",
+    ]):
+        attack = "Exfiltration"
+        confidence = 0.72
+
+    elif any(x in text for x in [
+        "RECON",
+        "DISCOVERY",
+        "METADATA",
+        "ENUMERATION",
+        "PROBING",
+    ]):
+        attack = "Reconnaissance"
+        confidence = 0.70
+
+    elif any(x in cat for x in ["WEB", "HTTP", "POLICY"]) or dest_port in [80, 443, 8000, 8080, 3000]:
+        attack = "WebAttack"
+        confidence = 0.55
+
     else:
         attack = "Unknown"
+        confidence = 0.4
 
     return {
         "attack_type": attack,
-        "confidence": 0.5,
-        "reasoning": "Classification heuristique utilisée car Llama/Ollama est indisponible ou trop lent.",
+        "confidence": confidence,
+        "reasoning": "Classification heuristique IDS/HIDS utilisée car Llama/Ollama est indisponible ou trop lent.",
     }

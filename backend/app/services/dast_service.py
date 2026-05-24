@@ -1,23 +1,31 @@
 # ============================================================
-# M5 — Service DAST Sandbox Isolée — v14 FINAL
+# M5 — Service DAST Sandbox Isolée — v15
+#
+# FIX v15 — Network Switch Build → Sandbox
+#   Principe : le container est d'abord lancé sur un réseau
+#   bridge temporaire (internet OK) pour que l'app démarre
+#   proprement (npm install runtime, migrations DB, plugins...).
+#   Une fois l'app prête, on bascule vers sandbox-net
+#   (internal:true) et on vérifie l'isolation avant le scan ZAP.
+#
+#   Méthodes ajoutées :
+#     _create_build_network()      → crée bridge temporaire
+#     _run_on_build_network()      → lance container avec internet
+#     _switch_to_sandbox()         → connect sandbox + disconnect build
+#     _verify_container_isolated() → socket TCP python3 puis docker inspect
+#     _cleanup_build_network()     → supprime le réseau temporaire
+#     _deploy_with_network_switch()→ orchestration complète
+#
+#   run_uploaded_project(), run_git_project(), run_docker_image()
+#   utilisent maintenant _deploy_with_network_switch() au lieu
+#   de lancer directement dans sandbox-net.
+#
 # Fix v14.3 : _wait_for_uploaded_app TCP + HTTP + ZAP notify
-#             socket fermé dans finally (fix leak)
-#             timeout 300s dans run_git_project ET run_uploaded_project
-#             sleep(30) + timeout(240) dans _llm_retry
-# Fix v14 : Retry intelligent LLM (Ollama llama3.1:8b)
-#           Après échec healthcheck → LLM analyse logs + fichiers
-#           → génère start.sh corrigé → rebuild → relaunch
-#           Universel : fonctionne pour toutes les stacks
-#           Intégré dans run_git_project ET run_uploaded_project
-# Fix v13 : DVPWA/aiohttp — patch config/dev.yaml au démarrage
-#           PostgreSQL : création user 'postgres' + db 'sqli'
-#           sed patch tous les YAMLs host: postgres → 127.0.0.1
-# Fix v13.2 : migrations SQL automatiques (find migrations/*.sql)
-# Fix v12 : support DVPWA/aiohttp + installation Python robuste
-# Fix v11 : ZAP 500 non accessible, abort si container crashé
-# Fix v10 : Dockerfile natif du repo si présent
-# Fix v9  : ascan 400 — forceAddToSiteMap + spider complet
-# Fix v8  : IP container via docker inspect (anti-ZAP 400 DNS)
+# Fix v14   : Retry intelligent LLM (Ollama llama3.1:8b)
+# Fix v13   : DVPWA/aiohttp — patch config/dev.yaml
+# Fix v12   : support DVPWA/aiohttp + installation Python robuste
+# Fix v11   : ZAP 500 non accessible, abort si container crashé
+# Fix v10   : Dockerfile natif du repo si présent
 # ============================================================
 
 import asyncio
@@ -118,27 +126,104 @@ def _safe_extract_zip(zip_path: str, dest_dir: Path) -> None:
 
 
 def _find_entrypoint(base: Path, depth: int = 0) -> Optional[Path]:
-    if depth > 4:
+    """
+    Trouve la vraie racine applicative.
+
+    Amélioration v15.1 :
+    - vérifie que les dossiers référencés par les scripts npm existent
+    - gère les monorepos frontend/backend/client/server
+    - utile pour Juice Shop, Angular, Vue, React avec workspace
+    """
+    if depth > 6:
         return None
+
     if (base / "pom.xml").exists():
         return base
+
     if (base / "package.json").exists():
         try:
             pkg = json.loads((base / "package.json").read_text(encoding="utf-8"))
-            if "start" in pkg.get("scripts", {}):
+            scripts = pkg.get("scripts", {})
+            scripts_text = " ".join(str(v) for v in scripts.values()).lower()
+
+            # Dossiers que les scripts npm référencent explicitement
+            required_dirs = []
+            if "frontend" in scripts_text:
+                required_dirs.append("frontend")
+            if "backend" in scripts_text:
+                required_dirs.append("backend")
+            if "client" in scripts_text:
+                required_dirs.append("client")
+            if "cd server" in scripts_text:
+                required_dirs.append("server")
+
+            missing_dirs = [d for d in required_dirs if not (base / d).exists()]
+
+            if missing_dirs:
+                logger.warning(
+                    f"package.json ignoré : dossiers référencés absents "
+                    f"{missing_dirs} dans {base}"
+                )
+            elif any(k in scripts for k in ["start", "serve", "dev", "build"]):
                 return base
-        except Exception:
-            pass
+
+        except Exception as e:
+            logger.warning(f"Lecture package.json impossible dans {base}: {e}")
+
     if (base / "requirements.txt").exists():
         return base
+
     if (base / "composer.json").exists() or any(base.glob("*.php")):
         return base
+
     for child in sorted(base.iterdir()):
         if child.is_dir() and child.name not in _IGNORE_DIRS and not child.name.startswith("."):
             result = _find_entrypoint(child, depth + 1)
             if result:
                 return result
+
     return None
+
+
+def _collect_project_text(project_dir: Path, max_file_size: int = 500_000) -> str:
+    """
+    Lit plusieurs fichiers de configuration/code pour détecter les besoins
+    runtime cachés (Redis/Postgres/etc.) qui ne sont pas toujours présents
+    dans requirements.txt.
+
+    Utile pour DVPWA/aiohttp : aioredis ou redis:// peut apparaître dans
+    config/dev.yaml, pyproject.toml, requirements-dev.txt, etc.
+    """
+    patterns = [
+        "*.py",
+        "*.yaml",
+        "*.yml",
+        "*.toml",
+        "*.ini",
+        "*.cfg",
+        "*.conf",
+        "requirements*.txt",
+        "Pipfile",
+        "poetry.lock",
+    ]
+
+    chunks = []
+    for pattern in patterns:
+        try:
+            for f in project_dir.rglob(pattern):
+                if not f.is_file():
+                    continue
+                if any(part in _IGNORE_DIRS for part in f.parts):
+                    continue
+                try:
+                    if f.stat().st_size <= max_file_size:
+                        chunks.append(f.read_text(errors="ignore").lower())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return "\n".join(chunks)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -195,16 +280,30 @@ def _analyze_project(project_dir: Path) -> dict:
             except Exception:
                 pass
         combined = reqs + "\n" + "\n".join(py_content_parts)
+        combined_full = combined + "\n" + _collect_project_text(project_dir)
 
-        analysis["needs_mongo"]    = any(x in combined for x in ["pymongo", "mongoengine", "motor"])
-        analysis["needs_redis"]    = any(x in combined for x in ["redis", "aioredis", "celery"])
-        analysis["needs_postgres"] = any(x in combined for x in ["psycopg2", "asyncpg", "sqlalchemy", "postgres"])
-        analysis["needs_mysql"]    = any(x in combined for x in ["pymysql", "mysqlclient", "aiomysql"])
+        redis_indicators = [
+            "redis",
+            "aioredis",
+            "redis://",
+            "redis_host",
+            "redis:",
+            "localhost:6379",
+            "127.0.0.1:6379",
+        ]
 
-        if "fastapi" in combined or "uvicorn" in combined:
+        analysis["needs_mongo"]    = any(x in combined_full for x in ["pymongo", "mongoengine", "motor", "mongodb://", "mongo:"])
+        analysis["needs_redis"]    = any(x in combined_full for x in redis_indicators)
+        analysis["needs_postgres"] = any(x in combined_full for x in ["psycopg2", "asyncpg", "sqlalchemy", "postgres", "postgresql://", "postgres:"])
+        analysis["needs_mysql"]    = any(x in combined_full for x in ["pymysql", "mysqlclient", "aiomysql", "mysql://", "mariadb"])
+
+        if "fastapi" in combined_full or "uvicorn" in combined_full:
             analysis["stack"] = "fastapi"; analysis["port"] = 8000
-        elif "aiohttp" in combined:
+        elif "aiohttp" in combined_full:
             analysis["stack"] = "aiohttp"; analysis["port"] = 8080
+            # DVPWA/aiohttp utilise souvent aioredis au runtime.
+            # On force Redis pour éviter Empty reply / connection reset.
+            analysis["needs_redis"] = True
         else:
             analysis["stack"] = "flask"; analysis["port"] = 5000
 
@@ -263,8 +362,12 @@ def _write_start_script(project_dir: Path, analysis: dict, app_cmd: str) -> str:
             "mongod --fork --logpath /var/log/mongodb/mongod.log --dbpath /data/db --bind_ip 127.0.0.1 --quiet",
             "echo 'Attente MongoDB...'", "sleep 4",
         ]
-    if analysis["needs_redis"]:
-        lines += ["redis-server --daemonize yes --loglevel warning", "sleep 1"]
+    if analysis["needs_redis"] or analysis.get("stack") == "aiohttp":
+        lines += [
+            "echo 'Démarrage Redis...'",
+            "redis-server --daemonize yes --loglevel warning",
+            "sleep 2",
+        ]
     if analysis["needs_postgres"]:
         lines += [
             "service postgresql start",
@@ -274,13 +377,11 @@ def _write_start_script(project_dir: Path, analysis: dict, app_cmd: str) -> str:
             "su postgres -c \"createdb -O mock mockdb 2>/dev/null\" || true",
             "su postgres -c \"psql -c \\\"ALTER USER postgres WITH PASSWORD 'postgres';\\\" 2>/dev/null\" || true",
             "su postgres -c \"createdb sqli 2>/dev/null\" || true",
-            # Migrations SQL automatiques
             "for sql_file in $(find /app/migrations /app/db /app/sql /app/database -name '*.sql' 2>/dev/null | sort); do",
             "  echo \"[CyberSentinel] Migration: $sql_file\"",
             "  su postgres -c \"psql -d sqli -f $sql_file 2>/dev/null\" || true",
             "  su postgres -c \"psql -d mockdb -f $sql_file 2>/dev/null\" || true",
             "done",
-            # Patch YAML configs
             "echo '[CyberSentinel] Patch YAML configs...'",
             "find /app -maxdepth 5 \\( -name '*.yaml' -o -name '*.yml' \\) 2>/dev/null | while read f; do",
             "  if grep -q 'host: postgres' \"$f\" 2>/dev/null; then",
@@ -305,6 +406,142 @@ def _write_start_script(project_dir: Path, analysis: dict, app_cmd: str) -> str:
     return "start.cybersentinel.sh"
 
 
+def _detect_node_version(project_dir: Path) -> str:
+    """
+    Détecte la version Node.js optimale depuis package.json.
+
+    Corrections :
+    - OWASP Juice Shop 20 exige Node 22 à 25.
+    - Respecte engines.node si le projet demande Node 22/23/24/25.
+    - Garde la compatibilité avec les projets Node 20/18/16.
+    """
+    package_json = project_dir / "package.json"
+
+    try:
+        if not package_json.exists():
+            logger.info("Version Node : 20 (package.json absent, défaut sécurisé)")
+            return "20"
+
+        pkg = json.loads(package_json.read_text(encoding="utf-8"))
+
+        engines = pkg.get("engines", {}) or {}
+        node_engine = str(engines.get("node", "")).lower().strip()
+        name = str(pkg.get("name", "")).lower().strip()
+        version = str(pkg.get("version", "")).lower().strip()
+        path_hint = str(project_dir).lower()
+
+        # Cas spécial OWASP Juice Shop récent.
+        # Les versions 20.x refusent de démarrer avec Node 20.
+        if "juice-shop" in name or "juice-shop" in path_hint:
+            logger.info(
+                f"Version Node : 22 détectée pour Juice Shop "
+                f"(name={name}, version={version}, engines.node={node_engine})"
+            )
+            return "22"
+
+        # engines.node explicite : versions récentes
+        if any(x in node_engine for x in [">=25", "^25", "25.", " 25"]):
+            logger.info(f"Version Node : 25 (engines.node={node_engine})")
+            return "25"
+
+        if any(x in node_engine for x in [">=24", "^24", "24.", " 24"]):
+            logger.info(f"Version Node : 24 (engines.node={node_engine})")
+            return "24"
+
+        if any(x in node_engine for x in [">=23", "^23", "23.", " 23"]):
+            logger.info(f"Version Node : 23 (engines.node={node_engine})")
+            return "23"
+
+        if any(x in node_engine for x in [">=22", "^22", "22.", " 22"]):
+            logger.info(f"Version Node : 22 (engines.node={node_engine})")
+            return "22"
+
+        # >=21 → choisir Node 22, stable et compatible.
+        if any(x in node_engine for x in [">=21", "^21", "21.", " 21"]):
+            logger.info(f"Version Node : 22 choisie pour compatibilité >=21 ({node_engine})")
+            return "22"
+
+        if any(x in node_engine for x in [">=20", "^20", "20.", " 20"]):
+            logger.info(f"Version Node : 20 (engines.node={node_engine})")
+            return "20"
+
+        if any(x in node_engine for x in [">=18", "^18", "18.", " 18"]):
+            logger.info(f"Version Node : 18 (engines.node={node_engine})")
+            return "18"
+
+        if any(x in node_engine for x in [">=16", "^16", "16.", " 16"]):
+            logger.info(f"Version Node : 16 (engines.node={node_engine})")
+            return "16"
+
+        deps = {
+            **pkg.get("dependencies", {}),
+            **pkg.get("devDependencies", {}),
+        }
+        deps_text = " ".join(deps.keys()).lower()
+
+        if any(d in deps_text for d in ["vite", "angular", "cypress", "nx"]):
+            logger.info("Version Node : 20 (dépendances modernes détectées)")
+            return "20"
+
+    except Exception as e:
+        logger.warning(f"Détection version Node impossible : {e}")
+
+    logger.info("Version Node : 18 (défaut)")
+    return "18"
+
+def _validate_project_structure(project_dir: Path, analysis: dict) -> Tuple[bool, str]:
+    """
+    Vérifie la cohérence de la structure avant le build.
+    Retourne (ok, message_erreur).
+
+    Évite les erreurs opaques :
+    - npm ERR! sh -c cd frontend — dossier absent
+    - node-gyp Python not found
+    - package.json valide mais racine incorrecte
+    """
+    if analysis.get("stack") != "node":
+        return True, ""
+
+    package_json = project_dir / "package.json"
+
+    if not package_json.exists():
+        return False, "Projet Node.js invalide : package.json introuvable."
+
+    try:
+        pkg = json.loads(package_json.read_text(encoding="utf-8"))
+        scripts = pkg.get("scripts", {})
+        scripts_text = " ".join(str(v) for v in scripts.values()).lower()
+
+        required_dirs = []
+        if "frontend" in scripts_text:
+            required_dirs.append("frontend")
+        if "backend" in scripts_text:
+            required_dirs.append("backend")
+        if "client" in scripts_text:
+            required_dirs.append("client")
+        if "cd server" in scripts_text:
+            required_dirs.append("server")
+
+        missing_dirs = [d for d in required_dirs if not (project_dir / d).exists()]
+
+        if missing_dirs:
+            return False, (
+                "Projet Node.js incomplet ou mauvaise racine détectée : "
+                f"package.json référence {missing_dirs} mais ces dossiers sont absents. "
+                "Uploadez le projet complet depuis sa racine."
+            )
+
+        if not any(k in scripts for k in ["start", "serve", "dev", "build"]):
+            logger.warning(
+                f"Projet Node.js sans script start/serve/dev/build : {project_dir}"
+            )
+
+    except Exception as e:
+        return False, f"Impossible de lire package.json : {e}"
+
+    return True, ""
+
+
 def _generate_dockerfile(analysis: dict) -> str:
     stack = analysis["stack"]
     needs_mongo = analysis["needs_mongo"]
@@ -314,7 +551,8 @@ def _generate_dockerfile(analysis: dict) -> str:
     entry = analysis.get("entry")
     port = analysis["port"]
     project_dir = Path(analysis["project_dir"])
-    services_needed = needs_mongo or needs_redis or needs_postgres or needs_mysql
+    forced_redis = needs_redis or stack == "aiohttp"
+    services_needed = needs_mongo or forced_redis or needs_postgres or needs_mysql
     python_version = "python:3.8-slim" if stack == "aiohttp" else "python:3.11-slim"
 
     build_deps = """RUN apt-get update && apt-get install -y --no-install-recommends \\
@@ -323,47 +561,104 @@ def _generate_dockerfile(analysis: dict) -> str:
 
 """
     replace_psycopg2 = """RUN sed -i -E 's/^psycopg2([=><!~].*)?$/psycopg2-binary/g' requirements.txt && \\
-    sed -i -E 's/^psycopg2-binary-binary/psycopg2-binary/g' requirements.txt && \\
-    echo "requirements.txt après correction:" && cat requirements.txt
+    sed -i -E 's/^psycopg2-binary-binary/psycopg2-binary/g' requirements.txt
 
 """
 
     if stack == "node":
+        # Détecter la version Node requise depuis engines.node
+        node_version = _detect_node_version(project_dir)
+
+        # Dépendances build natives obligatoires :
+        # - python3 + make + g++ → node-gyp pour modules natifs (libxmljs2, bcrypt, canvas...)
+        # - libxml2-dev + libxslt1-dev → libxmljs2 spécifiquement
+        # - git → postinstall scripts qui clonent des dépôts
+        node_build_packages = """RUN apt-get update && apt-get install -y --no-install-recommends \\
+    python3 python3-pip make g++ gcc build-essential pkg-config \\
+    libxml2-dev libxslt1-dev git ca-certificates curl \\
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+ENV PYTHON=/usr/bin/python3
+
+"""
+        # IMPORTANT : COPY . . AVANT npm install
+        # Certains projets (Juice Shop, monorepos) ont un postinstall
+        # qui dépend de dossiers internes (frontend/, lib/, etc.).
+        # L'ancien pattern COPY package*.json + npm install + COPY . .
+        # cassait ces projets.
         if services_needed:
             _write_start_script(project_dir, analysis, "npm start")
+
             mongo_repo = ""
             if needs_mongo:
+                # MongoDB repo Ubuntu Jammy (22.04) → libc6 >= 2.34 + libssl3 disponibles
+                # NE PAS utiliser node:bullseye avec ce repo (Debian 11 = libc6 2.31 → incompatible)
                 mongo_repo = """RUN curl -fsSL https://www.mongodb.org/static/pgp/server-6.0.asc | \\
     gpg --dearmor -o /usr/share/keyrings/mongodb.gpg && \\
     echo "deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" \\
-    > /etc/apt/sources.list.d/mongodb.list && \\
-    apt-get update && apt-get install -y mongodb-org"""
+    > /etc/apt/sources.list.d/mongodb-org-6.0.list && \\
+    apt-get update && apt-get install -y --no-install-recommends mongodb-org && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+"""
+
             extra_pkgs = []
             if needs_redis: extra_pkgs.append("redis-server")
             if needs_postgres: extra_pkgs += ["postgresql", "postgresql-client"]
             if needs_mysql: extra_pkgs.append("mariadb-server")
-            extra_install = f"RUN apt-get install -y {' '.join(extra_pkgs)}" if extra_pkgs else ""
+            extra_install = (
+                f"RUN apt-get update && apt-get install -y --no-install-recommends "
+                f"{' '.join(extra_pkgs)} "
+                f"&& apt-get clean && rm -rf /var/lib/apt/lists/*\n"
+            ) if extra_pkgs else ""
 
-            return f"""FROM ubuntu:22.04
+            if needs_mongo:
+                # MongoDB est compatible Ubuntu Jammy seulement.
+                # On utilise ubuntu:22.04 + NodeSource au lieu de node:bullseye
+                # pour éviter l'incompatibilité libc6/libssl3 (Debian 11 vs Ubuntu 22.04)
+                return f"""FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y curl gnupg2 ca-certificates && apt-get clean
-RUN curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && apt-get install -y nodejs
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    curl gnupg2 ca-certificates \\
+    python3 python3-pip make g++ gcc build-essential pkg-config \\
+    libxml2-dev libxslt1-dev git \\
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHON=/usr/bin/python3
+
+RUN curl -fsSL https://deb.nodesource.com/setup_{node_version}.x | bash - \\
+    && apt-get install -y nodejs \\
+    && npm install -g npm@latest \\
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 {mongo_repo}
 {extra_install}
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY package*.json ./
-RUN npm install --legacy-peer-deps || npm install --force
 COPY . .
+RUN npm install --legacy-peer-deps || npm install --force
+RUN chmod +x /app/start.cybersentinel.sh
+
+EXPOSE {port}
+CMD ["/bin/bash", "/app/start.cybersentinel.sh"]
+"""
+            # Services sans MongoDB (redis/postgres/mysql) → node:bullseye OK
+            return f"""FROM node:{node_version}-bullseye
+ENV DEBIAN_FRONTEND=noninteractive
+{node_build_packages}
+{extra_install}
+WORKDIR /app
+COPY . .
+RUN npm install --legacy-peer-deps || npm install --force
 RUN chmod +x /app/start.cybersentinel.sh
 EXPOSE {port}
 CMD ["/bin/bash", "/app/start.cybersentinel.sh"]
 """
-        return f"""FROM node:16-bullseye
+        # Node sans services — même principe : COPY . . avant npm install
+        return f"""FROM node:{node_version}-bullseye
+{node_build_packages}
 WORKDIR /app
-COPY package*.json ./
-RUN npm install --legacy-peer-deps || npm install --force
 COPY . .
+RUN npm install --legacy-peer-deps || npm install --force
 EXPOSE {port}
 CMD ["npm", "start"]
 """
@@ -371,7 +666,7 @@ CMD ["npm", "start"]
     elif stack in ("flask", "fastapi", "aiohttp"):
         extra_pip = ""
         if needs_mongo: extra_pip += "\nRUN pip install --no-cache-dir mongomock"
-        if needs_redis: extra_pip += "\nRUN pip install --no-cache-dir fakeredis"
+        if forced_redis: extra_pip += "\nRUN pip install --no-cache-dir fakeredis"
 
         if stack == "fastapi":
             module = f"{entry.replace('.py', '')}:app" if entry else "main:app"
@@ -390,11 +685,10 @@ CMD ["npm", "start"]
             extra_system_pkgs = ""
             if needs_postgres:
                 extra_system_pkgs += "\nRUN apt-get update && apt-get install -y postgresql postgresql-client && apt-get clean && rm -rf /var/lib/apt/lists/*\n"
-            if needs_redis:
+            if forced_redis:
                 extra_system_pkgs += "\nRUN apt-get update && apt-get install -y redis-server && apt-get clean && rm -rf /var/lib/apt/lists/*\n"
             if needs_mysql:
                 extra_system_pkgs += "\nRUN apt-get update && apt-get install -y mariadb-server mariadb-client && apt-get clean && rm -rf /var/lib/apt/lists/*\n"
-
             return f"""FROM {python_version}
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -460,9 +754,12 @@ CMD ["java", "-jar", "app.jar"]
 
 def _generate_env(analysis: dict) -> list:
     env = []
-    needs_mongo = analysis["needs_mongo"]; needs_redis = analysis["needs_redis"]
-    needs_postgres = analysis["needs_postgres"]; needs_mysql = analysis["needs_mysql"]
-    port = analysis["port"]; env_example = analysis.get("env_example", {})
+    needs_mongo    = analysis["needs_mongo"]
+    needs_redis    = analysis["needs_redis"]
+    needs_postgres = analysis["needs_postgres"]
+    needs_mysql    = analysis["needs_mysql"]
+    port           = analysis["port"]
+    env_example    = analysis.get("env_example", {})
 
     env += [
         f"PORT={port}", "HOST=0.0.0.0", "NODE_ENV=development",
@@ -483,9 +780,11 @@ def _generate_env(analysis: dict) -> list:
             "MONGOLAB_URI=mongodb://127.0.0.1:27017/mockdb",
             "MONGODB_URL=mongodb://127.0.0.1:27017/mockdb",
         ]
-    if needs_redis:
+    if needs_redis or analysis.get("stack") == "aiohttp":
         env += [
             "REDIS_URL=redis://127.0.0.1:6379/0", "REDIS_HOST=127.0.0.1", "REDIS_PORT=6379",
+            "REDIS_DSN=redis://127.0.0.1:6379/0",
+            "CACHE_URL=redis://127.0.0.1:6379/0",
             "CELERY_BROKER_URL=redis://127.0.0.1:6379/0",
             "CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/0",
         ]
@@ -544,6 +843,12 @@ def _detect_stack(project_dir: Path) -> dict:
     analysis = _analyze_project(project_dir)
     if not analysis["stack"]:
         raise ValueError("Stack non reconnue après analyse du projet.")
+
+    # Valider la structure avant de générer le Dockerfile
+    ok, validation_error = _validate_project_structure(project_dir, analysis)
+    if not ok:
+        raise ValueError(validation_error)
+
     return {
         "type": analysis["stack"], "port": analysis["port"],
         "project_dir": str(project_dir),
@@ -568,7 +873,7 @@ def _resolve_compose_file() -> Path:
 
 
 # ─────────────────────────────────────────────────────────────
-# FIX v14 : LLM retry universel — toutes stacks
+# LLM retry universel (v14)
 # ─────────────────────────────────────────────────────────────
 
 async def _llm_retry(
@@ -579,24 +884,24 @@ async def _llm_retry(
     target_url: str,
     stack_type: str,
     project_name: str,
+    build_network: Optional[str] = None,
 ) -> Tuple[bool, str, str]:
     """
     Retry intelligent LLM après échec healthcheck.
-    Retourne (success, new_target_url, final_logs).
-    Universel : fonctionne pour toutes les stacks auto (pas Dockerfile natif).
+    Si build_network est fourni, le nouveau container est lancé sur ce réseau
+    (internet OK) pour que le LLM puisse corriger et que l'app démarre.
+    Le switch vers sandbox-net est fait par l'appelant après succès.
     """
     try:
         from app.services.dast_llm_helper import generate_start_script
 
         logger.warning(f"[LLM RETRY] App '{project_name}' non accessible — tentative réparation LLM")
 
-        # Récupérer les logs du container
         _, logs_out, logs_err = await orchestrator._run_command(
             "docker", "logs", "--tail", "120", container_name, timeout=10,
         )
         final_logs = (logs_out + "\n" + logs_err).strip()
 
-        # Analyser le projet pour le contexte LLM
         try:
             stack_info = _detect_stack(project_dir)
             real_project_dir = Path(stack_info.get("project_dir", str(project_dir)))
@@ -605,13 +910,11 @@ async def _llm_retry(
 
         analysis = _analyze_project(real_project_dir)
 
-        # Lire le script actuel
         current_script = ""
         script_path = real_project_dir / "start.cybersentinel.sh"
         if script_path.exists():
             current_script = script_path.read_text(errors="ignore")
 
-        # Appel LLM
         new_script = await generate_start_script(
             project_dir=real_project_dir,
             current_script=current_script,
@@ -623,32 +926,31 @@ async def _llm_retry(
             logger.warning("[LLM RETRY] LLM n'a pas généré de script valide")
             return False, target_url, final_logs
 
-        # Écrire le nouveau script
         script_path.write_text(new_script, encoding="utf-8")
         script_path.chmod(0o755)
         logger.info(f"[LLM RETRY] Nouveau script écrit ({len(new_script)} chars)")
 
-        # Cleanup ancien container + image
         await orchestrator._cleanup_uploaded_target(container_name, image_name)
 
-        # Rebuild avec le nouveau script
-        code, new_target_url, error_msg, _ = await orchestrator._build_and_run(
+        # Rebuild et lancement sur réseau build (internet) si disponible
+        code, new_target_url, error_msg, _ = await orchestrator._build_and_run_on_network(
             real_project_dir, image_name, container_name,
+            network=build_network or "bridge",
         )
 
         if code != 0:
             logger.error(f"[LLM RETRY] Rebuild échoué: {error_msg[:300]}")
             return False, target_url, error_msg
 
-        # FIX v14.3 : délai plus long avant healthcheck (PostgreSQL + migrations)
         await asyncio.sleep(30)
         running, crash_logs = await orchestrator._check_container_running(container_name)
         if not running:
             logger.error(f"[LLM RETRY] Container crashé après LLM: {crash_logs[:300]}")
             return False, new_target_url, crash_logs
 
-        # FIX v14.3 : timeout augmenté à 240s pour stacks lourdes
-        ready = await orchestrator._wait_for_uploaded_app(new_target_url, timeout=240)
+        ready = await orchestrator._wait_for_app_via_backend_on_build_network(
+            new_target_url, build_network, timeout=240
+        ) if build_network else await orchestrator._wait_for_app_direct(new_target_url, timeout=240)
         if ready:
             logger.info(f"✅ [LLM RETRY] Succès ! App accessible sur {new_target_url}")
             return True, new_target_url, ""
@@ -703,62 +1005,54 @@ class DASTOrchestrator:
         cmd = ["docker", "compose", "-p", COMPOSE_PROJECT_NAME, "-f", str(cf), *args]
         return await self._run_command(*cmd, timeout=timeout, cwd=str(cf.parent))
 
-    async def _resolve_container_ip(self, container_name: str) -> str:
+    async def _resolve_container_ip(self, container_name: str, network: Optional[str] = None) -> str:
+        """
+        Résout l'IP du container.
+        Si network est fourni, retourne l'IP sur ce réseau spécifique.
+        Sinon retourne la première IP disponible.
+        """
+        if network:
+            # Les noms de réseau Docker contiennent parfois des tirets.
+            # Le template .Networks.cybersentinel_sandbox-net casse avec '-' ;
+            # il faut utiliser index.
+            fmt = f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}'
+        else:
+            fmt = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+
         code, out, err = await self._run_command(
-            "docker", "inspect",
-            "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-            container_name, timeout=10,
+            "docker", "inspect", "-f", fmt, container_name, timeout=10,
         )
         if code != 0:
             raise RuntimeError(f"Impossible de résoudre IP container {container_name}: {err or out}")
         ip = out.strip()
         if not ip:
-            raise RuntimeError(f"IP vide pour le container {container_name}")
-        logger.info(f"IP container {container_name} → {ip}")
+            raise RuntimeError(f"IP vide pour le container {container_name} (réseau: {network})")
+        logger.info(f"IP container {container_name} sur {network or 'any'} → {ip}")
         return ip
 
-    async def _target_url_from_container(self, container_name: str, port: int) -> str:
-        ip = await self._resolve_container_ip(container_name)
+    async def _target_url_from_container(self, container_name: str, port: int, network: Optional[str] = None) -> str:
+        ip = await self._resolve_container_ip(container_name, network)
         return f"http://{ip}:{port}"
 
     def _detect_port_from_dockerfile(self, dockerfile_path: Path) -> int:
         try:
             content = dockerfile_path.read_text(errors="ignore")
-
-            # 1. EXPOSE explicite — source de vérité, flag IGNORECASE pour robustesse
             match = re.search(r"EXPOSE\s+(\d+)", content, re.MULTILINE | re.IGNORECASE)
             if match:
-                logger.info(f"Port détecté via EXPOSE : {match.group(1)}")
                 return int(match.group(1))
-
-            # 2. Détection par stack si pas d'EXPOSE
             lower = content.lower()
-
             if any(kw in lower for kw in ["spring", "java", "maven", "gradle", ".jar"]):
-                logger.info("Port détecté par stack : Java/Spring → 8080")
                 return 8080
-
             if any(kw in lower for kw in ["node", "npm", "yarn"]):
-                logger.info("Port détecté par stack : Node.js → 3000")
                 return 3000
-
             if any(kw in lower for kw in ["uvicorn", "fastapi"]):
-                logger.info("Port détecté par stack : FastAPI → 8000")
                 return 8000
-
             if any(kw in lower for kw in ["aiohttp", "flask", "gunicorn", "python"]):
-                logger.info("Port détecté par stack : Python → 5000")
                 return 5000
-
             if any(kw in lower for kw in ["php", "apache", "nginx"]):
-                logger.info("Port détecté par stack : PHP/Web → 80")
                 return 80
-
         except Exception as e:
             logger.warning(f"_detect_port_from_dockerfile erreur: {e}")
-
-        # Fallback 8080 (plus courant que 3000 pour les repos avec Dockerfile natif)
-        logger.info("Port non détecté → fallback 8080")
         return 8080
 
     async def _verify_isolation(self) -> bool:
@@ -770,7 +1064,7 @@ class DASTOrchestrator:
             if code != 0:
                 return False
             is_internal = stdout.strip().lower() == "true"
-            logger.info("✅ Isolation OK" if is_internal else "❌ sandbox-net NON isolé")
+            logger.info("✅ Isolation sandbox-net OK" if is_internal else "❌ sandbox-net NON isolé")
             return is_internal
         except Exception as e:
             logger.error(f"Vérification isolation échouée: {e}")
@@ -794,76 +1088,646 @@ class DASTOrchestrator:
     async def _ensure_zap_only(self) -> dict:
         logger.info("Vérification/Démarrage ZAP seul")
         try:
-            # 1) Si ZAP existe déjà et répond, ne pas lancer docker compose up
             code, out, _ = await self._run_command(
-                "docker", "inspect",
-                "--format", "{{.State.Running}}",
-                "cybersentinel_zap",
-                timeout=10,
+                "docker", "inspect", "--format", "{{.State.Running}}",
+                "cybersentinel_zap", timeout=10,
             )
-
             if code == 0 and out.strip().lower() == "true":
-                logger.info("ZAP existe déjà — vérification API")
                 isolation_ok = await self._verify_isolation()
                 zap_ready    = await self._wait_for_zap(timeout=60)
-
                 if isolation_ok and zap_ready:
-                    logger.info("✅ ZAP déjà prêt, pas de recréation")
-                    return {
-                        "success": True,
-                        "isolation_ok": isolation_ok,
-                        "zap_ready": zap_ready,
-                        "details": "ZAP déjà existant et opérationnel",
-                    }
+                    return {"success": True, "isolation_ok": isolation_ok, "zap_ready": zap_ready,
+                            "details": "ZAP déjà existant et opérationnel"}
+                await self._run_command("docker", "rm", "-f", "cybersentinel_zap", timeout=60)
 
-                logger.warning("ZAP existe mais ne répond pas — recréation")
-                await self._run_command(
-                    "docker", "rm", "-f", "cybersentinel_zap", timeout=60,
-                )
-
-            # 2) Sinon démarrage normal via docker compose
-            logger.info("Démarrage ZAP via docker compose")
             code, stdout, stderr = await self._run_compose(
                 "--profile", "dast", "up", "-d", "--no-recreate", "zap", timeout=180,
             )
-
             if code != 0:
                 return {"success": False, "error": (stderr or stdout)[:1200]}
 
             await asyncio.sleep(5)
             isolation_ok = await self._verify_isolation()
             zap_ready    = await self._wait_for_zap(timeout=240)
-
-            return {
-                "success": bool(isolation_ok and zap_ready),
-                "isolation_ok": isolation_ok,
-                "zap_ready": zap_ready,
-            }
-
+            return {"success": bool(isolation_ok and zap_ready),
+                    "isolation_ok": isolation_ok, "zap_ready": zap_ready}
         except asyncio.TimeoutError:
             return {"success": False, "error": "Timeout ZAP (>180s)"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def _wait_for_uploaded_app(self, target_url: str, timeout: int = 120) -> bool:
+    # ─────────────────────────────────────────────────────────
+    # v15 — Network Switch : build → sandbox
+    # ─────────────────────────────────────────────────────────
+
+    async def _create_build_network(self, unique_id: str) -> str:
         """
-        FIX v15 : healthcheck depuis ZAP TCP.
-        Le backend n'est pas sur sandbox-net, mais ZAP l'est.
-        On exécute le test TCP depuis le container ZAP via docker exec.
-        TCP OK = la cible est joignable depuis ZAP, même si HTTP retourne empty reply.
+        Crée un réseau bridge temporaire AVEC accès internet.
+        Utilisé pour que l'app puisse démarrer complètement
+        (téléchargements runtime, migrations, plugins) avant
+        d'être basculée dans sandbox-net (internal:true).
+        """
+        network_name = f"cybersentinel_build_{unique_id}"
+        code, out, err = await self._run_command(
+            "docker", "network", "create",
+            "--driver", "bridge",
+            "--label", "cybersentinel=build-temp",
+            network_name,
+            timeout=30,
+        )
+        if code != 0:
+            raise RuntimeError(f"Création réseau build échouée : {err or out}")
+        logger.info(f"✅ Réseau build créé : {network_name}")
+        return network_name
+
+    async def _cleanup_build_network(self, build_network: str) -> None:
+        """
+        Supprime le réseau build temporaire.
+
+        Problème : si un container est encore attaché au réseau,
+        docker network rm échoue. On force la déconnexion de tous
+        les containers encore présents avant la suppression.
+        """
+        try:
+            # Lister les containers encore attachés au réseau build
+            code, out, err = await self._run_command(
+                "docker", "network", "inspect",
+                "--format",
+                "{{range .Containers}}{{.Name}} {{end}}",
+                build_network,
+                timeout=10,
+            )
+
+            if code == 0 and out.strip():
+                attached = out.strip().split()
+                logger.info(
+                    f"[CLEANUP] Containers encore sur {build_network} : {attached}"
+                )
+                # Forcer la déconnexion de chaque container
+                for cname in attached:
+                    dc_code, _, dc_err = await self._run_command(
+                        "docker", "network", "disconnect", "-f",
+                        build_network, cname,
+                        timeout=15,
+                    )
+                    if dc_code == 0:
+                        logger.info(f"[CLEANUP] {cname} déconnecté de {build_network}")
+                    else:
+                        logger.warning(
+                            f"[CLEANUP] Déconnexion {cname} échouée (non bloquant) : {dc_err}"
+                        )
+
+            # Supprimer le réseau build
+            rm_code, _, rm_err = await self._run_command(
+                "docker", "network", "rm", build_network,
+                timeout=30,
+            )
+            if rm_code == 0:
+                logger.info(f"✅ Réseau build supprimé : {build_network}")
+            else:
+                logger.warning(
+                    f"Réseau build non supprimé {build_network} : {rm_err}"
+                )
+
+        except Exception as e:
+            logger.warning(f"Erreur cleanup réseau build {build_network}: {e}")
+
+    async def _wait_for_app_direct(self, target_url: str, timeout: int = 300) -> bool:
+        """
+        Healthcheck direct depuis le backend pendant la phase build.
+
+        v15.3 :
+        - TCP seul n'est plus suffisant, car DVPWA ouvrait le port puis
+          retournait "Empty reply from server".
+        - On exige une vraie réponse HTTP sur / ou sur des chemins courants.
+        - Un statut < 500 est considéré comme prêt, même 404/403, car cela
+          prouve qu'un serveur HTTP répond correctement.
         """
         from urllib.parse import urlparse as _urlparse
+        import socket as _socket
 
         parsed = _urlparse(target_url)
         host = parsed.hostname
         port = parsed.port or 80
 
-        deadline = time.time() + timeout
-        consecutive_ok = 0
+        base = target_url.rstrip("/")
+        health_urls = [
+            base + "/",
+            base + "/login",
+            base + "/search",
+            base + "/products",
+            base + "/api/products",
+        ]
 
-        logger.info(f"Attente démarrage app via ZAP TCP : {host}:{port}")
+        deadline = time.time() + timeout
+        consecutive_tcp_ok = 0
+
+        logger.info(f"Attente démarrage app direct HTTP réel : {host}:{port}")
+
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            while time.time() < deadline:
+                # 1. TCP informatif uniquement
+                try:
+                    loop = asyncio.get_event_loop()
+
+                    def _tcp_check():
+                        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                        sock.settimeout(5)
+                        try:
+                            return sock.connect_ex((host, port))
+                        finally:
+                            sock.close()
+
+                    tcp_result = await loop.run_in_executor(None, _tcp_check)
+
+                    if tcp_result == 0:
+                        consecutive_tcp_ok += 1
+                        logger.info(
+                            f"Port {port} ouvert depuis backend "
+                            f"({consecutive_tcp_ok}) : {target_url}"
+                        )
+                    else:
+                        consecutive_tcp_ok = 0
+
+                except Exception as e:
+                    consecutive_tcp_ok = 0
+                    logger.info(f"Attente TCP app... {e}")
+
+                # 2. HTTP réel : critère principal
+                for url in health_urls:
+                    try:
+                        resp = await client.get(url, timeout=8)
+
+                        # Une réponse HTTP valide <500 suffit pour dire que
+                        # l'app est exploitable par ZAP. Le body peut être vide.
+                        if resp.status_code < 500:
+                            logger.info(
+                                f"✅ App prête via HTTP {resp.status_code} : "
+                                f"{url} body_len={len(resp.text or '')}"
+                            )
+                            return True
+
+                        logger.info(
+                            f"HTTP {resp.status_code} sur {url}, "
+                            f"body_len={len(resp.text or '')}"
+                        )
+
+                    except Exception as e:
+                        # Ici on attrape Empty reply / reset / timeout.
+                        logger.info(f"HTTP non prêt sur {url} : {e}")
+
+                await asyncio.sleep(5)
+
+        logger.error(f"❌ App non accessible HTTP après {timeout}s : {target_url}")
+        return False
+
+    async def _wait_for_app_via_backend_on_build_network(
+        self,
+        target_url: str,
+        build_network: str,
+        timeout: int = 300,
+    ) -> bool:
+        """
+        Connecte temporairement le backend au réseau build pour tester
+        l'URL http://IP_CONTAINER:PORT.
+
+        Sans cette connexion, le backend est seulement sur main-net/mgmt-net
+        et ne peut pas joindre l'IP privée du réseau cybersentinel_build_xxxxxxxx.
+        """
+        backend_container = os.getenv(
+            "CYBERSENTINEL_BACKEND_CONTAINER",
+            "cybersentinel_backend",
+        )
+        backend_connected = False
+
+        logger.info(
+            f"[SWITCH] Connexion backend au réseau build pour healthcheck : "
+            f"{backend_container} → {build_network}"
+        )
+
+        code, out, err = await self._run_command(
+            "docker", "network", "connect",
+            build_network,
+            backend_container,
+            timeout=30,
+        )
+        msg = (err or out or "").strip()
+
+        if code == 0:
+            backend_connected = True
+            logger.info(f"[SWITCH] ✅ Backend connecté à {build_network}")
+        elif "already exists" in msg.lower() or "already connected" in msg.lower():
+            backend_connected = True
+            logger.info(f"[SWITCH] Backend déjà connecté à {build_network}")
+        else:
+            logger.warning(f"[SWITCH] Connexion backend au build_network échouée : {msg}")
+
+        try:
+            return await self._wait_for_app_direct(target_url, timeout=timeout)
+        finally:
+            if backend_connected:
+                dc_code, dc_out, dc_err = await self._run_command(
+                    "docker", "network", "disconnect",
+                    build_network,
+                    backend_container,
+                    timeout=30,
+                )
+                dc_msg = (dc_err or dc_out or "").strip()
+                if dc_code == 0:
+                    logger.info(f"[SWITCH] ✅ Backend déconnecté du réseau build : {build_network}")
+                else:
+                    logger.warning(
+                        f"[SWITCH] Déconnexion backend du build_network échouée : {dc_msg}"
+                    )
+
+    async def _switch_to_sandbox(
+        self, container_name: str, build_network: str
+    ) -> Tuple[bool, str]:
+        """
+        Bascule le container du réseau build (internet) vers sandbox-net (isolé).
+
+        Ordre critique :
+        1. Connecter à sandbox-net D'ABORD (ZAP doit pouvoir joindre le container)
+        2. Déconnecter du réseau build (couper internet)
+        3. Vérifier l'isolation (python3 socket TCP puis docker inspect)
+        4. Résoudre la nouvelle IP sandbox-net
+
+        Retourne (success, new_sandbox_ip)
+        """
+        logger.info(f"[SWITCH] Bascule réseau : {build_network} → sandbox-net")
+
+        # 1. Connecter à sandbox-net
+        code, out, err = await self._run_command(
+            "docker", "network", "connect",
+            "cybersentinel_sandbox-net",
+            container_name,
+            timeout=30,
+        )
+        if code != 0:
+            logger.error(f"[SWITCH] Connexion sandbox-net échouée : {err}")
+            return False, ""
+
+        logger.info(f"[SWITCH] ✅ {container_name} connecté à sandbox-net")
+
+        # 2. Déconnecter du réseau build (couper internet)
+        code, out, err = await self._run_command(
+            "docker", "network", "disconnect",
+            build_network,
+            container_name,
+            timeout=30,
+        )
+        if code != 0:
+            logger.warning(f"[SWITCH] Déconnexion build_network échouée (non bloquant) : {err}")
+        else:
+            logger.info(f"[SWITCH] ✅ {container_name} déconnecté de {build_network}")
+
+        # 3. Vérifier l'isolation
+        isolated = await self._verify_container_isolated(container_name)
+        if not isolated:
+            logger.error(f"[SWITCH] ❌ ISOLATION ÉCHOUÉE pour {container_name}")
+            return False, ""
+
+        # 4. Résoudre la nouvelle IP sur sandbox-net
+        try:
+            # Le nom du réseau Docker normalise les tirets en underscores
+            net_key = "cybersentinel_sandbox-net"
+            sandbox_ip = await self._resolve_container_ip(container_name, net_key)
+            logger.info(f"[SWITCH] ✅ IP sandbox-net : {sandbox_ip}")
+            return True, sandbox_ip
+        except Exception as e:
+            logger.warning(f"[SWITCH] Résolution IP sandbox échouée (fallback) : {e}")
+            # Fallback : essayer sans réseau spécifique
+            try:
+                sandbox_ip = await self._resolve_container_ip(container_name)
+                return True, sandbox_ip
+            except Exception as e2:
+                logger.error(f"[SWITCH] IP introuvable : {e2}")
+                return False, ""
+
+    async def _verify_container_isolated(self, container_name: str) -> bool:
+        """
+        Vérifie que le container n'a plus accès à internet.
+
+        Cascade de tests — du plus fiable au fallback :
+
+        Méthode 1 — python3 socket TCP (fiable, sans dépendance externe)
+            Si python3 existe dans l'image, tente connexion TCP 8.8.8.8:53.
+            Succès → internet accessible → isolation échouée.
+            Échec (code=1) → isolé ✅
+            Absent (code=126/127) → fallback M2
+
+        Méthode 2 — docker network inspect (toujours disponible)
+            Vérifie que le container n'est connecté QU'à sandbox-net
+            ET que sandbox-net est bien internal:true.
+            Ne dépend d'aucun binaire dans l'image uploadée → plus robuste.
+
+        On évite ping car absent dans la plupart des images slim/alpine.
+        """
+        # ── Méthode 1 : python3 socket TCP vers 8.8.8.8:53 ──────────
+        code, out, err = await self._run_command(
+            "docker", "exec", container_name,
+            "python3", "-c",
+            (
+                "import socket, sys; "
+                "s = socket.socket(); "
+                "s.settimeout(3); "
+                "r = s.connect_ex(('8.8.8.8', 53)); "
+                "s.close(); "
+                "sys.exit(0 if r == 0 else 1)"
+            ),
+            timeout=10,
+        )
+
+        if code == 0:
+            # python3 a contacté 8.8.8.8 → encore sur internet → pas isolé
+            logger.error(
+                f"❌ [M1] ISOLATION ÉCHOUÉE (python3 socket) : "
+                f"{container_name} a encore accès à internet"
+            )
+            return False
+
+        if code == 1:
+            # python3 n'a pas pu joindre 8.8.8.8 → isolé ✅
+            logger.info(
+                f"✅ [M1] Isolation confirmée (python3 socket) : "
+                f"{container_name} sans accès internet"
+            )
+            return True
+
+        # code 126/127 → python3 absent dans l'image → méthode 2
+        logger.info(
+            f"[ISOLATION] python3 absent dans {container_name} "
+            f"(code={code}) → fallback docker inspect"
+        )
+
+        # ── Méthode 2 : docker network inspect ───────────────────────
+        # Récupère tous les réseaux auxquels le container est connecté
+        code2, out2, err2 = await self._run_command(
+            "docker", "inspect",
+            "--format",
+            "{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}",
+            container_name,
+            timeout=10,
+        )
+
+        if code2 != 0:
+            logger.warning(
+                f"[ISOLATION] docker inspect échoué pour {container_name}: {err2}"
+            )
+            # Impossible de vérifier → on refuse le scan par précaution (C-05)
+            return False
+
+        connected_networks = out2.strip().split()
+        logger.info(
+            f"[ISOLATION] Réseaux de {container_name} : {connected_networks}"
+        )
+
+        # Le container doit être connecté UNIQUEMENT à sandbox-net
+        sandbox_variants = {"cybersentinel_sandbox-net", "cybersentinel_sandbox_net"}
+        non_sandbox = [n for n in connected_networks if n not in sandbox_variants]
+
+        if non_sandbox:
+            logger.error(
+                f"❌ [M2] ISOLATION ÉCHOUÉE (docker inspect) : "
+                f"{container_name} encore sur : {non_sandbox}"
+            )
+            return False
+
+        # Vérifier que sandbox-net est bien internal:true
+        code3, out3, _ = await self._run_command(
+            "docker", "network", "inspect",
+            "cybersentinel_sandbox-net",
+            "--format", "{{.Internal}}",
+            timeout=10,
+        )
+
+        if code3 == 0 and out3.strip().lower() == "true":
+            logger.info(
+                f"✅ [M2] Isolation confirmée (docker inspect) : "
+                f"{container_name} sur sandbox-net internal:true uniquement"
+            )
+            return True
+
+        logger.error(
+            f"❌ [M2] sandbox-net non isolé (Internal={out3.strip()}) — "
+            f"scan DAST annulé (contrainte C-05)"
+        )
+        return False
+
+    async def _build_and_run_on_network(
+        self,
+        project_dir: Path,
+        image_name: str,
+        container_name: str,
+        network: str = "bridge",
+    ) -> Tuple[int, str, str, str]:
+        """
+        Build l'image et lance le container sur le réseau spécifié.
+        Contrairement à _build_and_run(), ne lance PAS sur sandbox-net.
+        C'est _switch_to_sandbox() qui s'en charge ensuite.
+        """
+        try:
+            stack = _detect_stack(project_dir)
+        except ValueError as e:
+            return 1, "", str(e), ""
+
+        real_project_dir = Path(stack.get("project_dir", str(project_dir)))
+        dockerfile_path = real_project_dir / "Dockerfile.cybersentinel"
+        dockerfile_path.write_text(stack["dockerfile"], encoding="utf-8")
+
+        logger.info(f"Build {stack['type']} → {image_name}")
+
+        build_code, build_out, build_err = await self._run_command(
+            "docker", "build", "--no-cache",
+            "-f", str(dockerfile_path), "-t", image_name, str(real_project_dir),
+            timeout=900, env={"DOCKER_BUILDKIT": "0"},
+        )
+
+        if build_code != 0:
+            dockerfile_content = dockerfile_path.read_text(errors="ignore") if dockerfile_path.exists() else ""
+            error_msg = (
+                f"Build échoué ({stack['type']}):\n\n"
+                f"DOCKERFILE:\n{dockerfile_content[:3000]}\n\n"
+                f"STDOUT:\n{build_out[-8000:]}\n\n"
+                f"STDERR:\n{build_err[-8000:]}"
+            )
+            logger.error(error_msg)
+            return build_code, "", error_msg, stack["type"]
+
+        env_args = []
+        for e in stack.get("env", []):
+            env_args += ["--env", e]
+
+        run_code, run_out, run_err = await self._run_command(
+            "docker", "run", "-d",
+            "--name", container_name,
+            "--network", network,  # ← réseau passé en paramètre
+            "--restart", "no",
+            *env_args, image_name,
+            timeout=120,
+        )
+
+        if run_code != 0:
+            return run_code, "", f"Lancement échoué : {(run_err or run_out)[:2000]}", stack["type"]
+
+        # IP sur le réseau de build
+        try:
+            ip = await self._resolve_container_ip(container_name)
+            target_url = f"http://{ip}:{stack['port']}"
+        except Exception as e:
+            target_url = f"http://{container_name}:{stack['port']}"
+            logger.warning(f"Fallback URL : {e}")
+
+        logger.info(f"Container lancé sur {network} → {target_url}")
+        return 0, target_url, "", stack["type"]
+
+    async def _deploy_with_network_switch(
+        self,
+        project_dir: Path,
+        image_name: str,
+        container_name: str,
+        unique_id: str,
+        dockerfile_native: bool = False,
+        port_override: Optional[int] = None,
+        project_name: str = "project",
+    ) -> Tuple[int, str, str, str]:
+        """
+        Pipeline complet v15 — Network Switch Build → Sandbox.
+
+        Étapes :
+        1. Créer réseau build temporaire (bridge + internet)
+        2. Builder l'image
+        3. Lancer le container sur réseau build
+        4. Attendre que l'app soit prête (avec internet)
+        5. LLM retry si nécessaire (sur réseau build toujours)
+        6. Basculer vers sandbox-net (couper internet)
+        7. Vérifier isolation (python3 socket TCP puis docker inspect)
+        8. Retourner l'URL sandbox pour ZAP
+
+        Retourne (code, sandbox_url, error_msg, stack_type)
+        """
+        build_network = None
+
+        try:
+            # ── Étape 1 : Créer réseau build ─────────────────
+            build_network = await self._create_build_network(unique_id)
+
+            # ── Étape 2+3 : Build + lancement sur réseau build ─
+            if dockerfile_native and port_override:
+                # Dockerfile natif du repo — build déjà fait par l'appelant
+                # On lance directement sur le réseau build
+                run_code, run_out, run_err = await self._run_command(
+                    "docker", "run", "-d",
+                    "--name", container_name,
+                    "--network", build_network,
+                    "--restart", "no",
+                    image_name, timeout=120,
+                )
+                if run_code != 0:
+                    return 1, "", f"Lancement échoué : {(run_err or run_out)[:600]}", "dockerfile"
+                try:
+                    ip = await self._resolve_container_ip(container_name)
+                    target_url = f"http://{ip}:{port_override}"
+                except Exception:
+                    target_url = f"http://{container_name}:{port_override}"
+                stack_type = "dockerfile"
+            else:
+                # Stack auto (node/python/php/spring)
+                code, target_url, error_msg, stack_type = await self._build_and_run_on_network(
+                    project_dir, image_name, container_name, network=build_network,
+                )
+                if code != 0:
+                    return code, "", error_msg, stack_type
+
+            # ── Étape 4 : Attendre prêt (avec internet) ──────
+            logger.info(f"[SWITCH] Attente démarrage app avec internet : {target_url}")
+
+            await asyncio.sleep(10)
+            running, crash_logs = await self._check_container_running(container_name)
+            if not running:
+                return 1, "", f"Container crashé : {crash_logs[:1000]}", stack_type
+
+            ready = await self._wait_for_app_via_backend_on_build_network(
+                target_url, build_network, timeout=300
+            )
+
+            # ── Étape 5 : LLM retry si nécessaire ────────────
+            if not ready and stack_type != "dockerfile":
+                logger.warning(f"[SWITCH] App non prête — LLM retry sur réseau build")
+                llm_ok, target_url, final_logs = await _llm_retry(
+                    self, project_dir, container_name, image_name,
+                    target_url, stack_type, project_name,
+                    build_network=build_network,
+                )
+                if not llm_ok:
+                    return 1, "", f"App non accessible après LLM retry.\n{final_logs[:2000]}", stack_type
+
+            elif not ready:
+                _, flo, fle = await self._run_command(
+                    "docker", "logs", "--tail", "50", container_name, timeout=10,
+                )
+                return 1, "", (
+                    f"App non accessible après 300s.\n{(flo + fle).strip()[:1000]}"
+                ), stack_type
+
+            # ── Étape 6+7 : Switch vers sandbox-net ──────────
+            logger.info(f"[SWITCH] App prête — bascule vers sandbox-net (isolation)")
+            isolated, sandbox_ip = await self._switch_to_sandbox(container_name, build_network)
+
+            if not isolated:
+                return 1, "", (
+                    "ISOLATION ÉCHOUÉE — scan DAST annulé (contrainte C-05). "
+                    "Le container a encore accès à internet après le switch réseau."
+                ), stack_type
+
+            # ── Étape 8 : URL sandbox pour ZAP ───────────────
+            try:
+                stack = _detect_stack(project_dir) if not dockerfile_native else {}
+                port = port_override or stack.get("port", 3000)
+            except Exception:
+                port = port_override or 3000
+
+            sandbox_url = f"http://{sandbox_ip}:{port}"
+            logger.info(f"✅ [SWITCH] App isolée et prête pour ZAP : {sandbox_url}")
+            return 0, sandbox_url, "", stack_type
+
+        finally:
+            # Toujours nettoyer le réseau build (même en cas d'erreur)
+            if build_network:
+                await self._cleanup_build_network(build_network)
+
+    # ─────────────────────────────────────────────────────────
+    # Healthcheck ZAP TCP (utilisé après switch réseau)
+    # ─────────────────────────────────────────────────────────
+
+    async def _wait_for_uploaded_app(self, target_url: str, timeout: int = 120) -> bool:
+        """
+        Healthcheck depuis ZAP après switch vers sandbox-net.
+
+        v15.3 :
+        - Le TCP prouve seulement que le port est ouvert.
+        - On exige aussi une réponse HTTP via curl depuis le container ZAP.
+        """
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(target_url)
+        host = parsed.hostname
+        port = parsed.port or 80
+        deadline = time.time() + timeout
+        consecutive_tcp_ok = 0
+
+        base = target_url.rstrip("/")
+        health_urls = [
+            base + "/",
+            base + "/login",
+            base + "/search",
+            base + "/products",
+            base + "/api/products",
+        ]
+
+        logger.info(f"Attente app via ZAP HTTP réel : {host}:{port}")
 
         while time.time() < deadline:
+            # 1. TCP informatif
             try:
                 code, out, err = await self._run_command(
                     "docker", "exec", "-u", "root", "cybersentinel_zap",
@@ -881,35 +1745,66 @@ class DASTOrchestrator:
                 )
 
                 if code == 0:
-                    consecutive_ok += 1
-                    logger.info(f"✅ Port {port} ouvert depuis ZAP TCP ({consecutive_ok}/2)")
-
-                    if consecutive_ok >= 2:
-                        logger.info(f"✅ App prête pour ZAP : {target_url}")
-                        try:
-                            async with httpx.AsyncClient() as client:
-                                await client.get(
-                                    f"{ZAP_HOST}/JSON/core/action/accessUrl/",
-                                    params={
-                                        "url": target_url,
-                                        "followRedirects": "true",
-                                    },
-                                    timeout=10,
-                                )
-                        except Exception as e:
-                            logger.warning(f"ZAP accessUrl non bloquant : {e}")
-                        return True
+                    consecutive_tcp_ok += 1
+                    logger.info(f"Port {port} ouvert depuis ZAP ({consecutive_tcp_ok})")
                 else:
-                    consecutive_ok = 0
-                    logger.info(f"Port {port} pas encore ouvert depuis ZAP TCP")
+                    consecutive_tcp_ok = 0
+                    logger.info(f"TCP depuis ZAP non prêt : {err or out}")
 
             except Exception as e:
-                consecutive_ok = 0
-                logger.info(f"Attente app via ZAP TCP... {e}")
+                consecutive_tcp_ok = 0
+                logger.info(f"Attente ZAP TCP... {e}")
+
+            # 2. HTTP réel depuis ZAP
+            for url in health_urls:
+                try:
+                    code_http, out_http, err_http = await self._run_command(
+                        "docker", "exec", "-u", "root", "cybersentinel_zap",
+                        "curl",
+                        "-k",
+                        "-sS",
+                        "-L",
+                        "--max-time", "10",
+                        "-o", "/tmp/cs_http_body",
+                        "-w", "%{http_code} %{size_download}",
+                        url,
+                        timeout=20,
+                    )
+
+                    if code_http == 0:
+                        parts = out_http.strip().split()
+                        http_code = int(parts[0]) if parts and parts[0].isdigit() else 0
+                        size = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+                        if 0 < http_code < 500:
+                            logger.info(
+                                f"✅ App HTTP valide depuis ZAP : "
+                                f"{url} code={http_code} size={size}"
+                            )
+                            try:
+                                async with httpx.AsyncClient() as client:
+                                    await client.get(
+                                        f"{ZAP_HOST}/JSON/core/action/accessUrl/",
+                                        params={"url": url, "followRedirects": "true"},
+                                        timeout=10,
+                                    )
+                            except Exception as e:
+                                logger.warning(f"ZAP accessUrl non bloquant : {e}")
+                            return True
+
+                        logger.info(
+                            f"HTTP depuis ZAP non valide : {url} "
+                            f"code={http_code} size={size}"
+                        )
+                    else:
+                        logger.info(f"HTTP depuis ZAP échoué : {url} | {err_http or out_http}")
+
+                except Exception as e:
+                    logger.info(f"HTTP ZAP exception sur {url} : {e}")
 
             await asyncio.sleep(5)
 
-        logger.error(f"❌ App non accessible depuis ZAP après {timeout}s")
+        logger.error(f"❌ App non accessible HTTP depuis ZAP après {timeout}s")
         return False
 
     async def _check_container_running(self, container_name: str) -> Tuple[bool, str]:
@@ -922,8 +1817,7 @@ class DASTOrchestrator:
                 _, logs_out, logs_err = await self._run_command(
                     "docker", "logs", "--tail", "80", container_name, timeout=10,
                 )
-                combined_logs = (logs_out + "\n" + logs_err).strip()
-                return False, combined_logs[:2000]
+                return False, (logs_out + "\n" + logs_err).strip()[:2000]
             return True, ""
         except Exception as e:
             return False, str(e)
@@ -944,12 +1838,14 @@ class DASTOrchestrator:
             except Exception as e:
                 logger.warning(f"Erreur rmi {image_name}: {e}")
 
+    # Conservé pour compatibilité interne (utilisé par _llm_retry v14 legacy)
     async def _build_and_run(
         self,
         project_dir: Path,
         image_name: str,
         container_name: str,
     ) -> Tuple[int, str, str, str]:
+        """Lance directement sur sandbox-net (mode WebGoat/DVWA)."""
         try:
             stack = _detect_stack(project_dir)
         except ValueError as e:
@@ -959,31 +1855,13 @@ class DASTOrchestrator:
         dockerfile_path = real_project_dir / "Dockerfile.cybersentinel"
         dockerfile_path.write_text(stack["dockerfile"], encoding="utf-8")
 
-        logger.info(f"Build auto {stack['type']} → {image_name}")
-        logger.info(f"Dockerfile généré : {dockerfile_path}")
-
         build_code, build_out, build_err = await self._run_command(
             "docker", "build", "--no-cache",
             "-f", str(dockerfile_path), "-t", image_name, str(real_project_dir),
             timeout=900, env={"DOCKER_BUILDKIT": "0"},
         )
-
         if build_code != 0:
-            dockerfile_content = ""
-            try:
-                dockerfile_content = dockerfile_path.read_text(errors="ignore")
-            except Exception:
-                dockerfile_content = "Impossible de lire Dockerfile.cybersentinel"
-            logger.error(
-                f"Build échoué:\nDOCKERFILE:\n{dockerfile_content[:5000]}"
-                f"\nSTDOUT:\n{build_out[-12000:]}\nSTDERR:\n{build_err[-12000:]}"
-            )
-            return (
-                build_code, "",
-                f"Build échoué ({stack['type']}):\n\nDOCKERFILE:\n{dockerfile_content[:5000]}"
-                f"\n\nSTDOUT:\n{build_out[-12000:]}\n\nSTDERR:\n{build_err[-12000:]}",
-                stack["type"],
-            )
+            return build_code, "", f"Build échoué:\n{build_err[-5000:]}", stack["type"]
 
         env_args = []
         for e in stack.get("env", []):
@@ -994,10 +1872,8 @@ class DASTOrchestrator:
             "--name", container_name,
             "--network", "cybersentinel_sandbox-net",
             "--restart", "no",
-            *env_args, image_name,
-            timeout=120,
+            *env_args, image_name, timeout=120,
         )
-
         if run_code != 0:
             return run_code, "", f"Lancement échoué : {(run_err or run_out)[:2000]}", stack["type"]
 
@@ -1005,13 +1881,10 @@ class DASTOrchestrator:
             target_url = await self._target_url_from_container(container_name, stack["port"])
         except Exception as e:
             target_url = f"http://{container_name}:{stack['port']}"
-            logger.warning(f"Fallback DNS: {e}")
-
-        logger.info(f"Container lancé → {target_url}")
         return 0, target_url, "", stack["type"]
 
     # ─────────────────────────────────────────────────────────
-    # Mode 1 — cible prédéfinie ou URL custom
+    # Mode 1 — cible prédéfinie WebGoat / DVWA
     # ─────────────────────────────────────────────────────────
 
     async def run_session(
@@ -1042,10 +1915,17 @@ class DASTOrchestrator:
         self._session_active     = True
         self._current_session_id = session_id
 
+        await self._reset_zap_session(session_id)
+
         results = {
-            "session_id": session_id, "target": resolved_name, "target_url": resolved_url,
+            "session_id": session_id,
+            "target": resolved_name,
+            "target_url": resolved_url,
             "started_at": datetime.now(timezone.utc).isoformat(),
-            "phases": {}, "findings": [], "pcap_path": None, "total_vulns": 0,
+            "phases": {},
+            "findings": [],
+            "pcap_path": None,
+            "total_vulns": 0,
         }
 
         try:
@@ -1080,11 +1960,10 @@ class DASTOrchestrator:
             self._session_active             = False
             self._current_session_id         = None
 
-        logger.info(f"DAST terminé | {results['total_vulns']} vulns | PCAP: {results['pcap_path']}")
         return results
 
     # ─────────────────────────────────────────────────────────
-    # Mode 2 — upload ZIP
+    # Mode 2 — Upload ZIP — v15 Network Switch
     # ─────────────────────────────────────────────────────────
 
     async def run_uploaded_project(self, zip_path: str, original_name: str) -> dict:
@@ -1092,102 +1971,87 @@ class DASTOrchestrator:
         image_name: Optional[str]     = None
         extract_dir: Optional[Path]   = None
         project_dir: Optional[Path]   = None
+
         try:
             if self._session_active:
                 return {"error": "Session DAST déjà active", "session_id": self._current_session_id}
+
             isolation_ok = await self._verify_isolation()
             if not isolation_ok:
                 return {"error": "sandbox-net non isolé", "constraint": "C-05"}
+
             deploy_info = await self._ensure_zap_only()
             if not deploy_info.get("success"):
                 return {"error": "ZAP non disponible", "details": deploy_info}
 
-            container_name, image_name, target_url, extract_dir, project_dir = \
-                await self._deploy_uploaded_project(zip_path, original_name)
+            # Extraction ZIP
+            work_root = Path("/app/data/uploads_dast")
+            work_root.mkdir(parents=True, exist_ok=True)
+            unique_id    = uuid.uuid4().hex[:8]
+            project_slug = _safe_name(Path(original_name).stem)
+            extract_dir  = work_root / f"{project_slug}_{unique_id}"
+            extract_dir.mkdir(parents=True, exist_ok=True)
 
-            await asyncio.sleep(5)
-            running, crash_logs = await self._check_container_running(container_name)
-            if not running:
-                logger.error(f"Container crashé — logs:\n{crash_logs}")
-                return {"error": f"Application '{original_name}' crashée au démarrage.", "container_logs": crash_logs}
+            try:
+                _safe_extract_zip(zip_path, extract_dir)
+            except Exception as e:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                return {"error": f"ZIP invalide : {e}"}
 
-            # FIX v14.3 : timeout augmenté à 300s pour ZIP avec stack lourde
-            ready = await self._wait_for_uploaded_app(target_url, timeout=300)
+            children    = list(extract_dir.iterdir())
+            project_dir = children[0] if (len(children) == 1 and children[0].is_dir()) else extract_dir
+            image_name     = f"cybersentinel-upload-{project_slug}:{unique_id}"
+            container_name = f"cybersentinel_target_{unique_id}"
 
-            # FIX v14 : LLM retry universel
-            if not ready and project_dir:
-                llm_ok, target_url, final_logs = await _llm_retry(
-                    self, project_dir, container_name, image_name,
-                    target_url, "auto", original_name,
-                )
-                ready = llm_ok
-                if not ready:
-                    return {
-                        "error": f"Application '{original_name}' non accessible après retry LLM.",
-                        "container_logs": final_logs[:3000],
-                        "llm_retry": True,
-                    }
+            # v15 — Deploy avec network switch
+            code, sandbox_url, error_msg, stack_type = await self._deploy_with_network_switch(
+                project_dir, image_name, container_name, unique_id,
+                project_name=original_name,
+            )
 
-            if not ready:
-                _, flo, fle = await self._run_command(
-                    "docker", "logs", "--tail", "50", container_name, timeout=10,
-                )
+            if code != 0:
                 return {
-                    "error": f"Application '{original_name}' non accessible après 300s.",
-                    "container_logs": (flo + "\n" + fle).strip()[:1000],
+                    "error": f"Déploiement échoué pour '{original_name}'",
+                    "details": error_msg,
                 }
 
+            # Vérifier accessible depuis ZAP
+            ready = await self._wait_for_uploaded_app(sandbox_url, timeout=120)
+            if not ready:
+                return {"error": f"App '{original_name}' non accessible depuis ZAP après switch réseau."}
+
             result = await self.run_session(
-                target="custom", target_url=target_url, deploy_target=False, internal_target=True,
+                target="custom", target_url=sandbox_url,
+                deploy_target=False, internal_target=True,
             )
             result["uploaded_project"] = {
                 "filename": original_name, "container_name": container_name,
-                "image_name": image_name, "target_url": target_url,
+                "image_name": image_name, "target_url": sandbox_url,
+                "stack": stack_type, "network_switch": True,
             }
             return result
+
         except ValueError as e:
             return {"error": str(e)}
         except Exception as e:
             logger.exception(f"run_uploaded_project erreur: {e}")
             return {"error": str(e)}
         finally:
-            await self._cleanup_uploaded_target(container_name, image_name)
-            if extract_dir:
-                shutil.rmtree(extract_dir, ignore_errors=True)
+            if os.getenv("DAST_KEEP_FAILED_CONTAINERS", "false").lower() == "true":
+                logger.warning(
+                    f"[DEBUG] Container/upload conservé : {container_name} | {extract_dir}"
+                )
+            else:
+                await self._cleanup_uploaded_target(container_name, image_name)
+                if extract_dir:
+                    shutil.rmtree(extract_dir, ignore_errors=True)
             try:
                 Path(zip_path).unlink(missing_ok=True)
             except Exception:
                 pass
 
-    async def _deploy_uploaded_project(
-        self, zip_path: str, original_name: str
-    ) -> Tuple[str, str, str, Path, Path]:
-        work_root = Path("/app/data/uploads_dast")
-        work_root.mkdir(parents=True, exist_ok=True)
-        unique_id    = uuid.uuid4().hex[:8]
-        project_slug = _safe_name(Path(original_name).stem)
-        extract_dir  = work_root / f"{project_slug}_{unique_id}"
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            _safe_extract_zip(zip_path, extract_dir)
-        except Exception as e:
-            shutil.rmtree(extract_dir, ignore_errors=True)
-            raise ValueError(f"ZIP invalide : {e}")
-
-        children    = list(extract_dir.iterdir())
-        project_dir = children[0] if (len(children) == 1 and children[0].is_dir()) else extract_dir
-        image_name     = f"cybersentinel-upload-{project_slug}:{unique_id}"
-        container_name = f"cybersentinel_target_{unique_id}"
-
-        code, target_url, error_msg, _ = await self._build_and_run(project_dir, image_name, container_name)
-        if code != 0:
-            logger.error(f"Build échoué — dossier conservé pour debug : {extract_dir}")
-            raise RuntimeError(error_msg)
-
-        return container_name, image_name, target_url, extract_dir, project_dir
-
     # ─────────────────────────────────────────────────────────
-    # Mode 3 — repo GitHub → clone → build natif ou auto → ZAP
+    # Mode 3 — Repo GitHub — v15 Network Switch
     # ─────────────────────────────────────────────────────────
 
     async def run_git_project(
@@ -1218,6 +2082,7 @@ class DASTOrchestrator:
             if not deploy_info.get("success"):
                 return {"error": "ZAP non disponible", "details": deploy_info}
 
+            # Clone du repo
             logger.info(f"Clone {repo_url}@{branch} → {clone_dir}")
             clone_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1240,116 +2105,64 @@ class DASTOrchestrator:
             image_name      = f"cybersentinel-git-{project_slug}:{unique_id}"
             container_name  = f"cybersentinel_target_{unique_id}"
             dockerfile_path = project_dir / "Dockerfile"
+            dockerfile_native = dockerfile_path.exists()
 
-            if dockerfile_path.exists():
-                logger.info("Dockerfile trouvé dans le repo → build direct")
+            # Build image
+            if dockerfile_native:
+                logger.info("Dockerfile natif trouvé — build direct")
                 build_code, build_out, build_err = await self._run_command(
                     "docker", "build", "--no-cache", "-t", image_name, str(project_dir),
                     timeout=900, env={"DOCKER_BUILDKIT": "0"},
                 )
                 if build_code != 0:
-                    return {
-                        "error": f"Build échoué:\n\nSTDOUT:\n{build_out[-12000:]}"
-                                 f"\n\nSTDERR:\n{build_err[-12000:]}"
-                    }
-
+                    return {"error": f"Build échoué:\nSTDOUT:\n{build_out[-8000:]}\nSTDERR:\n{build_err[-8000:]}"}
                 port = self._detect_port_from_dockerfile(dockerfile_path)
-                run_code, run_out, run_err = await self._run_command(
-                    "docker", "run", "-d",
-                    "--name", container_name,
-                    "--network", "cybersentinel_sandbox-net",
-                    "--restart", "no",
-                    image_name, timeout=120,
-                )
-                if run_code != 0:
-                    return {"error": f"Lancement échoué : {(run_err or run_out)[:600]}"}
-
-                try:
-                    target_url = await self._target_url_from_container(container_name, port)
-                except Exception as e:
-                    target_url = f"http://{container_name}:{port}"
-                    logger.warning(f"Fallback DNS: {e}")
-                stack_type = "dockerfile"
-
             else:
-                logger.info("Aucun Dockerfile trouvé → build automatique CyberSentinel")
-                code, target_url, error_msg, stack_type = await self._build_and_run(
-                    project_dir, image_name, container_name,
-                )
-                if code != 0:
-                    return {"error": error_msg}
+                port = None  # détecté dans _deploy_with_network_switch
 
-            logger.info(f"Container lancé → {target_url} (stack: {stack_type})")
+            # v15 — Deploy avec network switch
+            code, sandbox_url, error_msg, stack_type = await self._deploy_with_network_switch(
+                project_dir, image_name, container_name, unique_id,
+                dockerfile_native=dockerfile_native,
+                port_override=port,
+                project_name=project_name,
+            )
 
-            # Délai initial pour laisser le temps aux services de démarrer
-            await asyncio.sleep(30)
-            running, crash_logs = await self._check_container_running(container_name)
-            if not running:
-                logger.error(f"Container crashé — logs:\n{crash_logs}")
-                return {
-                    "error": f"Application '{project_name}' crashée au démarrage.",
-                    "container_logs": crash_logs,
-                }
+            if code != 0:
+                return {"error": f"Déploiement échoué pour '{project_name}'", "details": error_msg}
 
-            # FIX v14.3 : timeout augmenté à 300s pour stacks lourdes (postgres+migrations)
-            ready = await self._wait_for_uploaded_app(target_url, timeout=300)
-
-            # FIX v14 : LLM retry universel — uniquement pour stack auto (pas Dockerfile natif)
-            if not ready and stack_type != "dockerfile":
-                llm_ok, target_url, final_logs = await _llm_retry(
-                    self, project_dir, container_name, image_name,
-                    target_url, stack_type, project_name,
-                )
-                ready = llm_ok
-                if not ready:
-                    return {
-                        "error": f"Application '{project_name}' non accessible après retry LLM.",
-                        "container_logs": final_logs[:3000],
-                        "llm_retry": True,
-                    }
-            elif not ready:
-                _, flo, fle = await self._run_command(
-                    "docker", "logs", "--tail", "50", container_name, timeout=10,
-                )
-                return {
-                    "error": f"Application '{project_name}' non accessible après 300s.",
-                    "container_logs": (flo + "\n" + fle).strip()[:1000],
-                }
+            # Vérifier accessible depuis ZAP
+            ready = await self._wait_for_uploaded_app(sandbox_url, timeout=120)
+            if not ready:
+                return {"error": f"App '{project_name}' non accessible depuis ZAP après switch réseau."}
 
             result = await self.run_session(
-                target="custom", target_url=target_url,
+                target="custom", target_url=sandbox_url,
                 deploy_target=False, internal_target=True,
             )
             result["git_project"] = {
-                "repo_url":       repo_url,
-                "branch":         branch,
-                "project_name":   project_name,
-                "stack":          stack_type,
-                "dockerfile":     "native" if (project_dir / "Dockerfile").exists() else "auto",
-                "container_name": container_name,
-                "image_name":     image_name,
-                "target_url":     target_url,
+                "repo_url": repo_url, "branch": branch, "project_name": project_name,
+                "stack": stack_type,
+                "dockerfile": "native" if dockerfile_native else "auto",
+                "container_name": container_name, "image_name": image_name,
+                "target_url": sandbox_url, "network_switch": True,
             }
             return result
 
         except ValueError as e:
-            logger.warning(f"run_git_project ValueError: {e}")
             return {"error": str(e)}
         except Exception as e:
             logger.exception(f"run_git_project erreur: {e}")
             return {"error": str(e)}
         finally:
             if os.getenv("DAST_KEEP_FAILED_CONTAINERS", "false").lower() == "true":
-                logger.warning(
-                    f"[DEBUG DAST] Container conservé pour inspection : "
-                    f"container={container_name} image={image_name} clone={clone_dir}"
-                )
+                logger.warning(f"[DEBUG] Container conservé : {container_name} | {clone_dir}")
             else:
                 await self._cleanup_uploaded_target(container_name, image_name)
                 shutil.rmtree(clone_dir, ignore_errors=True)
 
     # ─────────────────────────────────────────────────────────
-    # Mode 4 — image Docker pré-buildée → Trivy + ZAP
+    # Mode 4 — Image Docker pré-buildée — v15 Network Switch
     # ─────────────────────────────────────────────────────────
 
     async def run_docker_image(
@@ -1360,35 +2173,28 @@ class DASTOrchestrator:
         scan_profile: str = "baseline",
     ) -> dict:
         container_name = f"cybersentinel_target_{uuid.uuid4().hex[:8]}"
+        unique_id      = uuid.uuid4().hex[:8]
+        build_network  = None
+
         try:
             if self._session_active:
                 return {"error": "Session DAST déjà active", "session_id": self._current_session_id}
 
             code, out, _ = await self._run_command("docker", "image", "inspect", image_name, timeout=10)
             if code != 0:
-                return {"error": f"Image '{image_name}' introuvable. Lance : docker build -t {image_name} ."}
-
-            logger.info(f"Scan Trivy image : {image_name}")
-            trivy_code, trivy_out, _ = await self._run_command(
-                "docker", "run", "--rm",
-                "-v", "/var/run/docker.sock:/var/run/docker.sock",
-                "aquasec/trivy:latest", "image", "--format", "json",
-                "--severity", "HIGH,CRITICAL", image_name, timeout=120,
-            )
-            trivy_results = {}
-            try:
-                trivy_results = json.loads(trivy_out) if trivy_out else {}
-            except Exception:
-                pass
+                return {"error": f"Image '{image_name}' introuvable."}
 
             deploy_info = await self._ensure_zap_only()
             if not deploy_info.get("success"):
                 return {"error": "ZAP non disponible", "details": deploy_info}
 
+            # v15 — Lancer sur réseau build d'abord
+            build_network = await self._create_build_network(unique_id)
+
             run_code, run_out, run_err = await self._run_command(
                 "docker", "run", "-d",
                 "--name", container_name,
-                "--network", "cybersentinel_sandbox-net",
+                "--network", build_network,
                 "--restart", "no",
                 "--memory", "512m", "--cpus", "1",
                 "--pids-limit", "256", "--cap-drop", "ALL",
@@ -1399,30 +2205,41 @@ class DASTOrchestrator:
                 return {"error": f"Lancement container échoué : {(run_err or run_out)[:500]}"}
 
             try:
-                target_url = await self._target_url_from_container(container_name, internal_port)
-            except Exception as e:
+                ip = await self._resolve_container_ip(container_name)
+                target_url = f"http://{ip}:{internal_port}"
+            except Exception:
                 target_url = f"http://{container_name}:{internal_port}"
-                logger.warning(f"Fallback DNS: {e}")
-
-            logger.info(f"Container lancé → {target_url}")
 
             await asyncio.sleep(5)
             running, crash_logs = await self._check_container_running(container_name)
             if not running:
-                logger.error(f"Container crashé — logs:\n{crash_logs}")
-                return {"error": f"Image '{image_name}' crashée au démarrage.", "container_logs": crash_logs}
+                return {"error": f"Image '{image_name}' crashée.", "container_logs": crash_logs}
 
-            ready = await self._wait_for_uploaded_app(target_url, timeout=120)
+            # Attendre prêt avec internet
+            ready = await self._wait_for_app_via_backend_on_build_network(
+                target_url, build_network, timeout=120
+            )
             if not ready:
                 return {"error": f"Application non accessible après 120s sur le port {internal_port}"}
 
+            # Switch vers sandbox-net
+            isolated, sandbox_ip = await self._switch_to_sandbox(container_name, build_network)
+            if not isolated:
+                return {"error": "ISOLATION ÉCHOUÉE — scan annulé (contrainte C-05)"}
+
+            sandbox_url = f"http://{sandbox_ip}:{internal_port}"
+
+            ready_zap = await self._wait_for_uploaded_app(sandbox_url, timeout=60)
+            if not ready_zap:
+                return {"error": "App non accessible depuis ZAP après switch réseau."}
+
             result = await self.run_session(
-                target="custom", target_url=target_url, deploy_target=False, internal_target=True,
+                target="custom", target_url=sandbox_url,
+                deploy_target=False, internal_target=True,
             )
             result["docker_image_scan"] = {
                 "image_name": image_name, "container_name": container_name,
-                "internal_port": internal_port,
-                "trivy_summary": trivy_results.get("Results", []),
+                "internal_port": internal_port, "network_switch": True,
             }
             return result
 
@@ -1430,7 +2247,79 @@ class DASTOrchestrator:
             logger.exception(f"run_docker_image erreur: {e}")
             return {"error": str(e)}
         finally:
+            if build_network:
+                await self._cleanup_build_network(build_network)
             await self._cleanup_uploaded_target(container_name, None)
+
+    async def _zap_proxy_browse(self, target_url: str) -> None:
+        """
+        Force ZAP à voir la cible dans son Scan Tree via son proxy HTTP.
+
+        accessUrl retourne parfois 500 avec certaines apps aiohttp/DVPWA.
+        En passant par curl -x http://127.0.0.1:8090 depuis le container ZAP,
+        on force réellement du trafic HTTP à travers le proxy ZAP.
+        """
+        paths = [
+            "",
+            "/",
+            "/robots.txt",
+            "/sitemap.xml",
+
+            "/login",
+            "/login/",
+            "/register",
+            "/users",
+            "/products",
+            "/search",
+
+            # URLs avec paramètres pour donner une surface d'attaque à ZAP
+            "/search?q=test",
+            "/search?q=admin",
+            "/search?q=%27",
+            "/products?id=1",
+            "/products?id=1%27",
+            "/users?id=1",
+            "/users?id=1%27",
+
+            # APIs fréquentes dans DVPWA / apps vulnérables
+            "/api/products",
+            "/api/products?id=1",
+            "/api/products?id=1%27",
+            "/api/users",
+            "/api/users?id=1",
+            "/api/users?id=1%27",
+            "/api/search?q=test",
+            "/api/search?q=%27",
+        ]
+
+        base = target_url.rstrip("/")
+
+        logger.info("[DAST] Warmup ZAP proxy browse : %s", target_url)
+
+        for path in paths:
+            url = base + path
+
+            try:
+                code, out, err = await self._run_command(
+                    "docker", "exec", "-u", "root", "cybersentinel_zap",
+                    "curl",
+                    "-k",
+                    "-sS",
+                    "-L",
+                    "--max-time", "10",
+                    "-x", "http://127.0.0.1:8090",
+                    url,
+                    timeout=20,
+                )
+
+                logger.info(
+                    "[DAST] Proxy browse %s → code=%s",
+                    url,
+                    code,
+                )
+
+            except Exception as e:
+                logger.warning("[DAST] Proxy browse ignoré %s : %s", url, e)
 
     # ─────────────────────────────────────────────────────────
     # Phases internes ZAP
@@ -1458,8 +2347,7 @@ class DASTOrchestrator:
             isolation_ok = await self._verify_isolation()
             zap_ready    = await self._wait_for_zap(timeout=240)
             return {"success": bool(isolation_ok and zap_ready),
-                    "isolation_ok": isolation_ok, "zap_ready": zap_ready,
-                    "details": stdout[:300] if stdout else None}
+                    "isolation_ok": isolation_ok, "zap_ready": zap_ready}
         except asyncio.TimeoutError:
             return {"success": False, "error": "Timeout (>180s)"}
         except Exception as e:
@@ -1493,295 +2381,252 @@ class DASTOrchestrator:
             return {"success": False, "error": str(e), "urls_found": 0}
 
     async def _phase_inject(self, target_url: str) -> dict:
+        """
+        Phase 3 — Active scan ZAP.
+
+        Correction DVPWA :
+        - accessUrl peut retourner 500 même si l'app est accessible.
+        - ascan/action/scan peut retourner 400 si l'URL n'est pas bien dans le site tree.
+        - On force l'exploration des URLs du spider avant de relancer l'active scan.
+        - Si l'active scan échoue encore, on continue quand même pour collecter les alertes passives.
+        """
         logger.info(f"Phase 3 — Active scan {target_url}")
-        parsed      = urlparse(target_url)
-        target_base = f"{parsed.scheme}://{parsed.netloc}"
+        await self._zap_proxy_browse(target_url)
+        await asyncio.sleep(3)
 
         try:
-            async with httpx.AsyncClient(timeout=300) as client:
-
-                logger.info(f"Spider complet avant active scan : {target_url}")
+            async with httpx.AsyncClient(timeout=180) as client:
+                # 1. Spider renforcé pour peupler le site tree ZAP
                 try:
                     spider_resp = await client.get(
                         f"{ZAP_HOST}/JSON/spider/action/scan/",
-                        params={"url": target_url, "maxChildren": 50, "recurse": "true"},
-                        timeout=30,
+                        params={
+                            "url": target_url,
+                            "maxChildren": "50",
+                            "recurse": "true",
+                        },
                     )
                     spider_data = spider_resp.json()
-                    spider_id   = spider_data.get("scan")
-                    if spider_id:
-                        logger.info(f"Spider lancé : id={spider_id}")
-                        deadline_sp = time.time() + 120
-                        while time.time() < deadline_sp:
-                            st = (await client.get(
+                    spider_id = spider_data.get("scan")
+
+                    if spider_id is not None:
+                        for _ in range(60):
+                            status_resp = await client.get(
                                 f"{ZAP_HOST}/JSON/spider/view/status/",
-                                params={"scanId": spider_id}, timeout=10,
-                            )).json()
-                            prog = int(st.get("status", 0))
-                            if prog >= 100:
-                                logger.info(f"✅ Spider terminé à {prog}%")
+                                params={"scanId": spider_id},
+                            )
+                            status = int(status_resp.json().get("status", 0))
+                            if status >= 100:
                                 break
-                            await asyncio.sleep(3)
-                except Exception as e:
-                    logger.warning(f"Spider pré-scan failed (non bloquant): {e}")
+                            await asyncio.sleep(2)
 
-                site_ok = False
+                        try:
+                            results_resp = await client.get(
+                                f"{ZAP_HOST}/JSON/spider/view/results/",
+                                params={"scanId": spider_id},
+                            )
+                            urls = results_resp.json().get("results", []) or []
+                            logger.info(f"[DAST] Spider URLs découvertes : {len(urls)}")
+
+                            # Forcer ZAP à accéder à quelques URLs découvertes
+                            for u in urls[:30]:
+                                try:
+                                    await client.get(
+                                        f"{ZAP_HOST}/JSON/core/action/accessUrl/",
+                                        params={
+                                            "url": u,
+                                            "followRedirects": "true",
+                                        },
+                                        timeout=10,
+                                    )
+                                except Exception:
+                                    pass
+
+                        except Exception as e:
+                            logger.warning(f"[DAST] Lecture résultats spider ignorée : {e}")
+
+                except Exception as e:
+                    logger.warning(f"[DAST] Spider renforcé ignoré : {e}")
+
+                # 2. accessUrl sur l'URL principale, non bloquant
                 try:
-                    sites_resp = await client.get(f"{ZAP_HOST}/JSON/core/view/sites/", timeout=10)
-                    raw_sites = sites_resp.json()
-                    sites_list = raw_sites.get("sites", [])
-                    if isinstance(sites_list, str):
-                        sites_list = [sites_list] if sites_list else []
-                    logger.info(f"Sites ZAP connus : {sites_list}")
-                    if any(target_base in str(s) for s in sites_list):
-                        logger.info(f"✅ URL dans Sites ZAP : {target_base}")
-                        site_ok = True
+                    access_resp = await client.get(
+                        f"{ZAP_HOST}/JSON/core/action/accessUrl/",
+                        params={
+                            "url": target_url,
+                            "followRedirects": "true",
+                        },
+                        timeout=20,
+                    )
+                    if access_resp.status_code >= 400:
+                        logger.warning(
+                            f"[DAST] accessUrl non OK mais non bloquant : "
+                            f"{access_resp.status_code} {access_resp.text[:300]}"
+                        )
                 except Exception as e:
-                    logger.warning(f"Sites ZAP check failed: {e}")
+                    logger.warning(f"[DAST] accessUrl échoué mais non bloquant : {e}")
 
-                if not site_ok:
-                    logger.info(f"URL absente des Sites ZAP → forceAddToSiteMap")
-                    try:
-                        await client.get(
-                            f"{ZAP_HOST}/JSON/core/action/sendRequest/",
-                            params={
-                                "request": f"GET / HTTP/1.1\r\nHost: {parsed.netloc}\r\n\r\n",
-                                "followRedirects": "true",
-                            },
-                            timeout=15,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        await client.get(
-                            f"{ZAP_HOST}/JSON/core/action/accessUrl/",
-                            params={"url": target_url, "followRedirects": "true"},
-                            timeout=20,
-                        )
-                        logger.info("accessUrl forcé OK")
-                    except Exception as e:
-                        logger.warning(f"accessUrl failed: {e}")
-                    await asyncio.sleep(3)
+                # 3. Activer les scanners ZAP de manière plus agressive
+                try:
+                    await client.get(
+                        f"{ZAP_HOST}/JSON/ascan/action/enableAllScanners/",
+                        timeout=20,
+                    )
+                    await client.get(
+                        f"{ZAP_HOST}/JSON/ascan/action/setOptionAttackStrength/",
+                        params={"String": "HIGH"},
+                        timeout=20,
+                    )
+                    await client.get(
+                        f"{ZAP_HOST}/JSON/ascan/action/setOptionAlertThreshold/",
+                        params={"String": "LOW"},
+                        timeout=20,
+                    )
+                    logger.info(
+                        "[DAST] ZAP scanners activés : attackStrength=HIGH, alertThreshold=LOW"
+                    )
+                except Exception as e:
+                    logger.warning(f"[DAST] Configuration scanners ZAP ignorée : {e}")
 
-                logger.info(f"Lancement active scan : {target_url}")
+                # 4. Active scan
                 scan_resp = await client.get(
                     f"{ZAP_HOST}/JSON/ascan/action/scan/",
-                    params={"url": target_url, "recurse": "true"},
-                    timeout=60,
+                    params={
+                        "url": target_url,
+                        "recurse": "true",
+                    },
+                    timeout=30,
                 )
 
-                try:
-                    scan_data = scan_resp.json()
-                except Exception:
-                    return {"success": False, "error": f"Réponse ZAP invalide : {scan_resp.text[:300]}"}
+                if scan_resp.status_code != 200:
+                    logger.warning(
+                        f"[DAST] Active scan refusé par ZAP "
+                        f"HTTP {scan_resp.status_code} : {scan_resp.text[:500]}"
+                    )
+                    return {
+                        "success": True,
+                        "active_scan_started": False,
+                        "warning": "Active scan refusé par ZAP, collecte passive maintenue",
+                        "http_status": scan_resp.status_code,
+                    }
 
-                if scan_resp.status_code == 400:
-                    logger.warning(f"ascan 400 — réponse ZAP: {scan_data}")
-                    try:
-                        scan_resp2 = await client.get(
-                            f"{ZAP_HOST}/JSON/ascan/action/scan/",
-                            params={"recurse": "true"}, timeout=60,
-                        )
-                        scan_data = scan_resp2.json()
-                    except Exception as e:
-                        return {"success": False, "error": f"Active scan refusé par ZAP : {e}"}
+                data = scan_resp.json()
+                scan_id = data.get("scan")
 
-                scan_id = scan_data.get("scan")
                 if scan_id is None:
-                    return {"success": False, "error": f"Active scan invalide : {scan_data}"}
+                    return {
+                        "success": True,
+                        "active_scan_started": False,
+                        "warning": f"Réponse ZAP sans scan id : {data}",
+                    }
 
-                logger.info(f"✅ Active scan démarré : {scan_id}")
+                logger.info(f"[DAST] Active scan lancé scanId={scan_id}")
 
-                deadline_a = time.time() + 600
-                while time.time() < deadline_a:
-                    progress = int((await client.get(
+                # 4. Attendre fin active scan
+                last_status = -1
+                for _ in range(180):
+                    status_resp = await client.get(
                         f"{ZAP_HOST}/JSON/ascan/view/status/",
-                        params={"scanId": scan_id}, timeout=15,
-                    )).json().get("status", 0))
-                    logger.info(f"Active scan progress: {progress}%")
-                    if progress >= 100:
-                        logger.info("✅ Active scan terminé")
-                        return {"success": True, "scan_id": scan_id, "progress": progress}
+                        params={"scanId": scan_id},
+                        timeout=20,
+                    )
+                    status = int(status_resp.json().get("status", 0))
+
+                    if status != last_status:
+                        logger.info(f"Active scan progress: {status}%")
+                        last_status = status
+
+                    if status >= 100:
+                        break
+
                     await asyncio.sleep(5)
 
-                return {"success": False, "scan_id": scan_id, "error": "Timeout active scan (>600s)"}
+                return {
+                    "success": True,
+                    "active_scan_started": True,
+                    "scan_id": scan_id,
+                    "status": last_status,
+                }
 
         except Exception as e:
-            logger.exception("Erreur active scan")
-            return {"success": False, "error": str(e)}
+            logger.exception(f"Phase active scan échouée : {e}")
+            return {
+                "success": True,
+                "active_scan_started": False,
+                "warning": str(e),
+            }
 
     async def _start_pcap_capture(self, session_id: str) -> Optional[Path]:
-            """
-            Capture le trafic réseau pendant le scan ZAP.
+        backend_pcap_storage   = Path("/shared/dast_captures")
+        container_pcap_storage = "/shared/dast_captures"
 
-            Correction :
-            - tcpdump est lancé dans ZAP avec docker exec -u root
-            - le PCAP est écrit dans /shared/dast_captures/{session_id}.pcap
-            - le backend vérifie aussi /shared/dast_captures
-            - permissions corrigées après capture avec chmod 644
+        backend_pcap_storage.mkdir(parents=True, exist_ok=True)
 
-            Volume attendu dans docker-compose :
-                ./data/dast_captures:/shared/dast_captures
-            """
-            backend_pcap_storage = Path("/shared/dast_captures")
-            container_pcap_storage = "/shared/dast_captures"
+        host_path      = backend_pcap_storage / f"{session_id}.pcap"
+        container_path = f"{container_pcap_storage}/{session_id}.pcap"
 
-            backend_pcap_storage.mkdir(parents=True, exist_ok=True)
+        check_code, _, check_err = await self._run_command(
+            "docker", "exec", "-u", "root", "cybersentinel_zap",
+            "test", "-d", container_pcap_storage, timeout=5,
+        )
+        if check_code != 0:
+            logger.warning("Volume PCAP non accessible dans ZAP : %s", check_err)
+            return None
 
-            host_path = backend_pcap_storage / f"{session_id}.pcap"
-            container_path = f"{container_pcap_storage}/{session_id}.pcap"
+        td_code, _, td_err = await self._run_command(
+            "docker", "exec", "-u", "root", "cybersentinel_zap",
+            "which", "tcpdump", timeout=5,
+        )
+        if td_code != 0:
+            logger.warning("tcpdump absent dans cybersentinel_zap : %s", td_err)
+            return None
 
-            # 1. Vérifier que le volume partagé existe dans ZAP
-            check_code, _, check_err = await self._run_command(
+        await self._run_command(
+            "docker", "exec", "-u", "root", "cybersentinel_zap",
+            "rm", "-f", container_path, timeout=5,
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
                 "docker", "exec", "-u", "root", "cybersentinel_zap",
-                "test", "-d", container_pcap_storage,
-                timeout=5,
+                "timeout", "180", "tcpdump",
+                "-i", "any", "-w", container_path, "-s", "0", "not", "arp",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=190)
+            except asyncio.TimeoutError:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                stdout = b""
+                stderr = b"timeout local"
 
-            if check_code != 0:
-                logger.warning(
-                    "Volume PCAP non accessible dans ZAP : %s | erreur=%s",
-                    container_pcap_storage,
-                    check_err,
-                )
+            check_file, _, _ = await self._run_command(
+                "docker", "exec", "-u", "root", "cybersentinel_zap",
+                "test", "-s", container_path, timeout=5,
+            )
+            if check_file != 0:
                 return None
 
-            # 2. Vérifier que tcpdump existe dans ZAP
-            td_code, _, td_err = await self._run_command(
-                "docker", "exec", "-u", "root", "cybersentinel_zap",
-                "which", "tcpdump",
-                timeout=5,
-            )
-
-            if td_code != 0:
-                logger.warning(
-                    "tcpdump absent dans cybersentinel_zap. "
-                    "Ajoute tcpdump dans docker/zap/Dockerfile. erreur=%s",
-                    td_err,
-                )
-                return None
-
-            # 3. Nettoyer un ancien fichier éventuel
             await self._run_command(
                 "docker", "exec", "-u", "root", "cybersentinel_zap",
-                "rm", "-f", container_path,
-                timeout=5,
+                "chmod", "644", container_path, timeout=5,
             )
 
-            try:
-                logger.info(
-                    "Démarrage capture PCAP DAST | session=%s | fichier=%s",
-                    session_id,
-                    container_path,
-                )
+            if host_path.exists() and host_path.stat().st_size > 0:
+                logger.info("PCAP créé : %s | %.1f KB", host_path, host_path.stat().st_size / 1024)
+                return host_path
+            return None
 
-                # 4. Lancer tcpdump dans ZAP avec root
-                proc = await asyncio.create_subprocess_exec(
-                    "docker", "exec", "-u", "root", "cybersentinel_zap",
-                    "timeout", "180",
-                    "tcpdump",
-                    "-i", "any",
-                    "-w", container_path,
-                    "-s", "0",
-                    "not", "arp",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(),
-                        timeout=190,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Timeout local capture PCAP session=%s — arrêt forcé tcpdump",
-                        session_id,
-                    )
-
-                    try:
-                        proc.terminate()
-                        await asyncio.wait_for(proc.wait(), timeout=5)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-
-                    stdout = b""
-                    stderr = b"timeout local"
-
-                stdout_text = stdout.decode(errors="ignore") if stdout else ""
-                stderr_text = stderr.decode(errors="ignore") if stderr else ""
-
-                logger.info(
-                    "tcpdump terminé session=%s | code=%s | stdout=%s | stderr=%s",
-                    session_id,
-                    proc.returncode,
-                    stdout_text[-500:],
-                    stderr_text[-1000:],
-                )
-
-                # 5. Vérifier côté ZAP que le fichier existe et n'est pas vide
-                check_file, _, check_file_err = await self._run_command(
-                    "docker", "exec", "-u", "root", "cybersentinel_zap",
-                    "test", "-s", container_path,
-                    timeout=5,
-                )
-
-                if check_file != 0:
-                    logger.warning(
-                        "PCAP non créé ou vide dans ZAP | session=%s | path=%s | erreur=%s",
-                        session_id,
-                        container_path,
-                        check_file_err,
-                    )
-                    return None
-
-                # 6. Rendre le fichier lisible par backend / host / celery
-                await self._run_command(
-                    "docker", "exec", "-u", "root", "cybersentinel_zap",
-                    "chmod", "644", container_path,
-                    timeout=5,
-                )
-
-                # 7. Vérifier côté backend via /shared/dast_captures
-                if host_path.exists() and host_path.stat().st_size > 0:
-                    logger.info(
-                        "PCAP créé et visible backend : %s | %.1f KB",
-                        host_path,
-                        host_path.stat().st_size / 1024,
-                    )
-                    return host_path
-
-                # 8. Debug si ZAP voit le fichier mais backend ne le voit pas
-                ls_code, ls_out, ls_err = await self._run_command(
-                    "docker", "exec", "-u", "root", "cybersentinel_zap",
-                    "ls", "-lh", container_path,
-                    timeout=5,
-                )
-
-                logger.warning(
-                    "PCAP créé côté ZAP mais non visible côté backend | "
-                    "session=%s | backend_path=%s | backend_exists=%s | "
-                    "zap_ls_code=%s | zap_ls_out=%s | zap_ls_err=%s",
-                    session_id,
-                    host_path,
-                    host_path.exists(),
-                    ls_code,
-                    ls_out,
-                    ls_err,
-                )
-
-                return None
-
-            except Exception as e:
-                logger.exception(
-                    "Erreur capture PCAP session=%s : %s",
-                    session_id,
-                    e,
-                )
-                return None
+        except Exception as e:
+            logger.exception("Erreur capture PCAP session=%s : %s", session_id, e)
+            return None
 
     async def _phase_collect_proofs(self, target_url: str, session_id: str) -> list:
         logger.info("Phase 5 — Collecte des preuves ZAP")
@@ -1797,6 +2642,31 @@ class DASTOrchestrator:
                     f"{ZAP_HOST}/JSON/alert/view/alerts/",
                     params={"baseurl": target_url},
                 )).json().get("alerts", [])
+                if not alerts:
+                    logger.warning(
+                        "[DAST] Aucun alert avec baseurl=%s — fallback global ZAP alerts",
+                        target_url,
+                    )
+
+                    all_alerts = (await client.get(
+                        f"{ZAP_HOST}/JSON/alert/view/alerts/",
+                    )).json().get("alerts", [])
+
+                    parsed = urlparse(target_url)
+                    host = parsed.hostname or ""
+
+                    alerts = [
+                        a for a in all_alerts
+                        if host in str(a.get("url", ""))
+                        or target_url.rstrip("/") in str(a.get("url", ""))
+                    ]
+
+                    logger.info(
+                        "[DAST] Alertes ZAP filtrées pour %s : %s/%s",
+                        host,
+                        len(alerts),
+                        len(all_alerts),
+                    )
 
             for alert in alerts:
                 if alert.get("confidence") in ("False Positive", "Low"):
@@ -1831,51 +2701,269 @@ class DASTOrchestrator:
             logger.error(f"Collecte preuves erreur: {e}")
         logger.info(f"Phase 5: {len(findings)} vulnérabilités")
         return findings
-
+    
     async def _phase_teardown(self) -> dict:
+        """
+        Phase 6 — Teardown sandbox.
+
+        On garde ZAP actif pour éviter de le redémarrer à chaque scan.
+        Les containers uploadés sont nettoyés ailleurs selon
+        DAST_KEEP_FAILED_CONTAINERS.
+        """
         logger.info("Phase 6 — Teardown sandbox")
+
         try:
-            # ZAP est conservé pour les scans suivants — on nettoie seulement webgoat/dvwa
-            await self._run_compose(
-                "--profile", "dast", "stop", "webgoat", "dvwa", timeout=120,
-            )
-            await self._run_compose(
-                "--profile", "dast", "rm", "-f", "webgoat", "dvwa", timeout=120,
-            )
-            logger.info("✅ Teardown terminé — ZAP conservé pour scans suivants")
-            return {"success": True, "zap_kept": True}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": "Timeout teardown"}
+            # On ne supprime pas ZAP, car il est réutilisé entre les scans.
+            # On ne fait pas docker compose down sinon on casse sandbox/mgmt.
+            logger.info("✅ Teardown terminé — ZAP conservé")
+            return {
+                "success": True,
+                "zap_kept": True,
+                "details": "ZAP conservé pour les prochains scans",
+            }
+
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            logger.warning(f"Teardown DAST échoué : {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        
+    async def _reset_zap_session(self, session_id: str) -> None:
+        """
+        Nettoie le scan tree ZAP avant chaque scan.
+
+        Sans ça, ZAP garde les anciennes cibles :
+        172.20.0.9, 172.20.0.17, etc.
+        Puis la collecte récupère des alertes anciennes au lieu
+        de la cible courante.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{ZAP_HOST}/JSON/core/action/newSession/",
+                    params={
+                        "name": session_id,
+                        "overwrite": "true",
+                    },
+                )
+
+                if resp.status_code == 200:
+                    logger.info(f"[DAST] Session ZAP réinitialisée : {session_id}")
+                else:
+                    logger.warning(
+                        f"[DAST] Reset session ZAP non OK : "
+                        f"{resp.status_code} {resp.text[:300]}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"[DAST] Reset session ZAP ignoré : {e}")
 
     async def _process_findings(self, findings: list, session_id: str) -> None:
+        """
+        Persiste les résultats DAST ZAP dans sast_findings.
+
+        Fix :
+        - une erreur sur un finding ne bloque plus toute la transaction ;
+        - rollback après chaque erreur ;
+        - insertion commitée finding par finding ;
+        - normalisation des valeurs avant insertion.
+        """
         from sqlalchemy import select
-        async with AsyncSessionLocal() as db:
-            for finding in findings:
-                zap_alert    = finding.get("zap_alert", "")
-                cwe          = finding.get("cwe", "")
-                technique_id = self.mitre_engine.resolve_ml_dast(zap_alert)
-                if technique_id:
-                    try:
-                        await self.mitre_engine.enrich_by_technique_id(technique_id)
-                    except Exception as e:
-                        logger.warning(f"MITRE enrich: {e}")
-                if cwe:
-                    result = await db.execute(
+        from app.models.sast_finding import SASTFinding
+
+        if not findings:
+            logger.info("[DAST] Aucun finding ZAP à persister | session=%s", session_id)
+            return
+
+        inserted = 0
+        confirmed_sast = 0
+        skipped = 0
+        failed = 0
+
+        for finding in findings:
+            async with AsyncSessionLocal() as db:
+                try:
+                    zap_alert = (
+                        finding.get("zap_alert")
+                        or finding.get("alert_name")
+                        or finding.get("title")
+                        or "ZAP Finding"
+                    )
+
+                    cwe = finding.get("cwe")
+                    url = finding.get("url") or finding.get("file_path") or ""
+                    method = finding.get("method") or "GET"
+                    param = finding.get("param") or ""
+                    evidence = finding.get("evidence") or ""
+                    description = finding.get("description") or ""
+                    solution = finding.get("solution") or ""
+                    severity = finding.get("severity") or "MEDIUM"
+
+                    if hasattr(severity, "value"):
+                        severity = severity.value
+
+                    severity = str(severity).upper()
+
+                    if severity not in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+                        if severity in ["CRITIQUE"]:
+                            severity = "CRITICAL"
+                        elif severity in ["ELEVE", "ÉLEVÉ"]:
+                            severity = "HIGH"
+                        elif severity in ["MOYEN"]:
+                            severity = "MEDIUM"
+                        elif severity in ["FAIBLE"]:
+                            severity = "LOW"
+                        else:
+                            severity = "MEDIUM"
+
+                    existing = await db.execute(
                         select(SASTFinding)
-                        .where(SASTFinding.cwe == cwe)
-                        .where(SASTFinding.dast_confirmed == 0)
+                        .where(SASTFinding.tool == "dast_zap")
+                        .where(SASTFinding.scan_id == session_id)
+                        .where(SASTFinding.title == zap_alert)
+                        .where(SASTFinding.file_path == url)
                         .limit(1)
                     )
-                    sf = result.scalar_one_or_none()
-                    if sf:
-                        sf.dast_confirmed = 1
-                        try:
-                            await self.scoring_engine.create_incident_from_sast(sf)
-                        except Exception as e:
-                            logger.warning(f"Scoring: {e}")
-            await db.commit()
+
+                    if existing.scalar_one_or_none():
+                        skipped += 1
+                        await db.rollback()
+                        continue
+
+                    technique_id = None
+                    technique_name = None
+                    tactic = None
+                    apt_groups = []
+
+                    try:
+                        technique_id = self.mitre_engine.resolve_ml_dast(zap_alert)
+
+                        if technique_id:
+                            mitre_data = await self.mitre_engine.enrich_by_technique_id(
+                                technique_id
+                            )
+                            technique_name = mitre_data.get("technique_name")
+                            tactic = mitre_data.get("tactic")
+                            apt_groups = mitre_data.get("apt_groups", []) or []
+
+                    except Exception as e:
+                        logger.warning("[DAST] MITRE enrich ignoré : %s", e)
+
+                    dast_finding = SASTFinding(
+                        tool="dast_zap",
+                        severity=severity,
+
+                        file_path=url[:1000] if url else "",
+                        line_number=None,
+                        line_start=None,
+                        line_end=None,
+                        col_start=None,
+                        col_end=None,
+
+                        code_snippet=f"{method} {url}".strip()[:4000],
+                        vulnerable_line=f"Parameter: {param}"[:1000] if param else None,
+
+                        rule_id=zap_alert[:500],
+                        cwe=cwe,
+                        cve=None,
+                        cvss_score=None,
+
+                        title=zap_alert[:500],
+                        description=description[:4000] if description else "",
+                        message=(evidence or description or zap_alert)[:4000],
+
+                        fix_suggestion=solution[:4000] if solution else "",
+                        fix_code=None,
+
+                        references=[],
+                        category="DAST",
+
+                        package_name=None,
+                        package_version=None,
+                        fix_version=None,
+
+                        secret_type=None,
+                        secret_preview=None,
+
+                        technique_id=technique_id,
+                        technique_name=technique_name,
+                        tactic=tactic,
+
+                        dast_confirmed=1,
+
+                        repo_name=finding.get("project_name") or "DAST_SCAN",
+                        commit_sha=None,
+                        pr_number=None,
+                        scan_id=session_id,
+
+                        sarif_raw={
+                            "source": "OWASP ZAP",
+                            "session_id": session_id,
+                            "alert_name": zap_alert,
+                            "risk": finding.get("risk"),
+                            "confidence": finding.get("confidence"),
+                            "url": url,
+                            "method": method,
+                            "param": param,
+                            "attack": finding.get("attack"),
+                            "evidence": evidence,
+                            "description": description,
+                            "solution": solution,
+                            "proof_path": finding.get("proof_path"),
+                            "cwe_id": finding.get("cwe_id"),
+                            "apt_groups": apt_groups,
+                            "raw": finding,
+                        },
+                    )
+
+                    db.add(dast_finding)
+                    await db.commit()
+                    inserted += 1
+
+                    if cwe:
+                        async with AsyncSessionLocal() as db2:
+                            try:
+                                sast_result = await db2.execute(
+                                    select(SASTFinding)
+                                    .where(SASTFinding.cwe == cwe)
+                                    .where(SASTFinding.tool != "dast_zap")
+                                    .where(SASTFinding.dast_confirmed == 0)
+                                    .limit(1)
+                                )
+
+                                sast_finding = sast_result.scalar_one_or_none()
+
+                                if sast_finding:
+                                    sast_finding.dast_confirmed = 1
+                                    await db2.commit()
+                                    confirmed_sast += 1
+
+                            except Exception as e:
+                                await db2.rollback()
+                                logger.warning(
+                                    "[DAST] Confirmation SAST ignorée : %s",
+                                    e,
+                                )
+
+                except Exception as e:
+                    failed += 1
+                    await db.rollback()
+                    logger.exception(
+                        "[DAST] Erreur insertion finding ZAP ignorée | title=%s | url=%s | error=%s",
+                        finding.get("title") or finding.get("zap_alert"),
+                        finding.get("url"),
+                        e,
+                    )
+
+        logger.info(
+            "[DAST] Findings persistés | session=%s | inserted=%s | confirmed_sast=%s | skipped=%s | failed=%s",
+            session_id,
+            inserted,
+            confirmed_sast,
+            skipped,
+            failed,
+        )
 
     def get_status(self) -> dict:
         return {"active": self._session_active, "session_id": self._current_session_id}
